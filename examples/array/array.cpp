@@ -42,9 +42,12 @@
 #include <libpmemobj++/persistent_ptr.hpp>
 #include <libpmemobj++/pool.hpp>
 #include <libpmemobj++/transaction.hpp>
+#include <libpmemobj++/experimental/string.hpp>
+#include <libpmemobj++/experimental/vector.hpp>
 
 using namespace pmem;
 using namespace pmem::obj;
+using namespace pmem::obj::experimental;
 
 namespace
 {
@@ -60,7 +63,6 @@ enum class array_op {
 };
 
 const int POOLSIZE = 1024 * 1024 * 64;
-const int MAX_BUFFLEN = 30;
 const std::string LAYOUT = "";
 std::string prog_name;
 
@@ -85,20 +87,36 @@ namespace examples
 {
 
 class pmem_array {
-	// array_list: struct to hold name, size, array and pointer to next
-	struct array_list {
-		char name[MAX_BUFFLEN];
+
+
+	// array_list_item: struct to hold name, size, and array
+	struct array_list_item {
+		persistent_ptr<string> name;
 		p<size_t> size;
 		persistent_ptr<int[]> array;
-		persistent_ptr<array_list> next;
 	};
 
-	persistent_ptr<array_list> head = nullptr;
+	using array_list_t = vector<persistent_ptr<array_list_item>>;
+	persistent_ptr<array_list_t> arrays;
 
 public:
+
+	// init: Initialise the vector of array_list_items if not yet created
+	void
+	init(pool_base &pop) {
+
+		if (arrays != nullptr)
+			return;
+
+		transaction::run(pop, [&] {
+			arrays = make_persistent<array_list_t>();
+		});
+
+	}
+
 	// add_array: allocate space on heap for new array and add it to head
 	void
-	add_array(pool_base &pop, const char *name, int size)
+	add_array(pool_base &pop, const char *name, size_t size)
 	{
 		if (find_array(name) != nullptr) {
 			std::cout << "Array with name: " << name
@@ -112,85 +130,84 @@ public:
 				  << std::endl;
 			print_usage(array_op::ALLOC, "./example-array");
 		} else {
+
 			transaction::run(pop, [&] {
-				auto new_array = make_persistent<array_list>();
+				std::cout << "Creating new array entry with name:"
+					<< name << std::endl;
 
-				strcpy(new_array->name, name);
+				auto new_array = make_persistent<array_list_item>();
 
-				new_array->size = (size_t)size;
+				new_array->name = make_persistent<string>(name);
+
+				new_array->size = size;
 				new_array->array = make_persistent<int[]>(size);
-				new_array->next = nullptr;
 
-				// assign values to newArray->array
-				for (size_t i = 0; i < new_array->size; i++)
-					new_array->array[i] = i;
+				// assign values to new_array->array
+				long val = 0;
+				auto max_int = std::numeric_limits<int>::max();
+				for (long i = 0; i < (long) new_array->size; i++) {
+					new_array->array[i] = val;
+					// int max may be smaller than array
+					val = val < max_int ? val + 1 : 0;
+				}
 
-				new_array->next = head;
-				head = new_array;
+				arrays->push_back(new_array);
 			});
 		}
 	}
 
-	// delete_array: deletes array from the array_list and removes
+	// delete_array: deletes array from the array_list_item and removes
 	// previously allocated space on heap
 	void
 	delete_array(pool_base &pop, const char *name)
 	{
-		// prevArr will equal head if array wanted is either first OR
-		// second element
-		persistent_ptr<array_list> prev_arr = find_array(name, true);
+		for (array_list_t::iterator it = arrays->begin();
+					       it != arrays->end();
+					       ++it) {
 
-		// if array_list length = 0 OR array not found in list
-		if (prev_arr == nullptr) {
-			std::cout << "No array found with name: " << name
-				  << std::endl;
-			return;
+			if (strcmp(it->get()->name->c_str(), name) == 0) {
+
+				transaction::run(pop, [&] {
+
+					delete_persistent<string>(it->get()->name);
+
+					delete_persistent<int[]>(it->get()->array,
+						                  it->get()->size);
+
+					arrays->erase(it);
+				});
+
+				return;
+			}
 		}
 
-		persistent_ptr<array_list> cur_arr;
-		if (strcmp(prev_arr->name, name) == 0) {
-			// cur = prev= head, either only one element in list or
-			// array is first element
-			cur_arr = head;
-		} else {
-			cur_arr = prev_arr->next;
-		}
-
-		transaction::run(pop, [&] {
-			if (head == cur_arr)
-				head = cur_arr->next;
-			else
-				prev_arr->next = cur_arr->next;
-
-			delete_persistent<int[]>(cur_arr->array, cur_arr->size);
-			delete_persistent<array_list>(cur_arr);
-		});
+		std::cout << "No array found with name: " << name;
 	}
 
-	// print_array: prints array_list contents to cout
+	// print_array: prints array_list_item contents to cout
 	void
 	print_array(const char *name)
 	{
-		persistent_ptr<array_list> arr = find_array(name);
+		persistent_ptr<array_list_item> arr = find_array(name);
 		if (arr == nullptr) {
 			std::cout << "No array found with name: " << name
 				  << std::endl;
 		} else {
-			std::cout << arr->name << " = [";
+			std::cout << arr->name->c_str() << " = [";
 
-			for (size_t i = 0; i < arr->size - 1; i++)
+			for (long i = 0; i < (long) arr->size - 1; i++)
 				std::cout << arr->array[i] << ", ";
 
-			std::cout << arr->array[arr->size - 1] << "]"
+			std::cout << arr->array[(long) (arr->size - 1)] << "]"
 				  << std::endl;
 		}
 	}
 
 	// resize: reallocate space on heap to change the size of the array
 	void
-	resize(pool_base &pop, const char *name, int size)
+	resize(pool_base &pop, const char *name, size_t size)
 	{
-		persistent_ptr<array_list> arr = find_array(name);
+		persistent_ptr<array_list_item> arr = find_array(name);
 		if (arr == nullptr) {
 			std::cout << "No array found with name: " << name
 				  << std::endl;
@@ -205,22 +222,22 @@ public:
 
 				size_t copy_size = arr->size;
 
-				if ((size_t)size < arr->size)
-					copy_size = (size_t)size;
+				if (size < arr->size)
+					copy_size = size;
 
-				for (size_t i = 0; i < copy_size; i++)
+				for (long i = 0; i < (long) copy_size; i++)
 					new_array[i] = arr->array[i];
 
 				delete_persistent<int[]>(arr->array, arr->size);
 
-				arr->size = (size_t)size;
+				arr->size = size;
 				arr->array = new_array;
 			});
 		}
 	}
 
 	// print_usage: prints usage for each type of array operation
-	void
+	static void
 	print_usage(array_op op, std::string arg_zero)
 	{
 		switch (op) {
@@ -256,29 +273,24 @@ public:
 
 private:
 	// find_array: loops through head to find array with specified name
-	persistent_ptr<array_list>
+	persistent_ptr<array_list_item>
 	find_array(const char *name, bool find_prev = false)
 	{
-		if (head == nullptr)
-			return head;
+		if (arrays->empty())
+			return nullptr; // empty
 
-		persistent_ptr<array_list> cur = head;
-		persistent_ptr<array_list> prev = head;
+		for (array_list_t::iterator it = arrays->begin() ;
+		                               it != arrays->end();
+		                               ++it) {
 
-		while (cur) {
-			if (strcmp(cur->name, name) == 0) {
-				if (find_prev)
-					return prev;
-				else
-					return cur;
+			if (strcmp(it->get()->name->c_str(), name) == 0) {
+				return it->get();
 			}
-
-			prev = cur;
-			cur = cur->next;
 		}
 
-		return nullptr;
+		return nullptr; // not found
 	}
+
 };
 }
 
@@ -304,17 +316,9 @@ main(int argc, char *argv[])
 		return 1;
 	}
 
-	// check length of array name to ensure doesn't exceed buffer.
 	const char *name = argv[3];
-	if (strlen(name) > MAX_BUFFLEN) {
-		std::cout
-			<< "Name exceeds buffer length of 30 characters. Please shorten and try again."
-			<< std::endl;
-
-		return 1;
-	}
-
 	const char *file = argv[1];
+
 	pool<examples::pmem_array> pop;
 
 	if (file_exists(file) != 0)
@@ -324,6 +328,8 @@ main(int argc, char *argv[])
 		pop = pool<examples::pmem_array>::open(file, LAYOUT);
 
 	persistent_ptr<examples::pmem_array> arr = pop.root();
+
+	arr->init(pop);
 
 	array_op op = parse_array_op(argv[2]);
 
@@ -342,13 +348,15 @@ main(int argc, char *argv[])
 			break;
 		case array_op::REALLOC:
 			if (argc == 5)
-				arr->resize(pop, name, atoi(argv[4]));
+				arr->resize(pop, name,
+					    (size_t) std::stol(argv[4]));
 			else
 				arr->print_usage(op, prog_name);
 			break;
 		case array_op::ALLOC:
 			if (argc == 5)
-				arr->add_array(pop, name, atoi(argv[4]));
+				arr->add_array(pop, name,
+					       (size_t) std::stol(argv[4]));
 			else
 				arr->print_usage(op, prog_name);
 			break;

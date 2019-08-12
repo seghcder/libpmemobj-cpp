@@ -90,12 +90,22 @@ function(build_example_pman)
 	endif()
 endfunction()
 
+function(build_example_array)
+	add_executable(ex-array ../examples/array/array.cpp)
+	target_include_directories(ex-array PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../examples)
+	target_link_libraries(ex-array ${LIBPMEMOBJ_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+endfunction()
+
 if(NO_GCC_VARIADIC_TEMPLATE_BUG)
 	build_example_queue()
 	add_test_generic(NAME ex-queue CASE 0 TRACERS none)
 
 	build_example_pman()
 	add_test_generic(NAME ex-pman CASE 0 TRACERS none)
+
+	build_example_array()
+	add_test_generic(NAME ex-array CASE 0 TRACERS none)
+
 else()
 	message(WARNING "Skipping examples tests because of gcc variadic template bug")
 	skip_test("examples_tests" "SKIPPED_BECAUSE_OF_GCC_VARIADIC_TEMPLATE_BUG")
