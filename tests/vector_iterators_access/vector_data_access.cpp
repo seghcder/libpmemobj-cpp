@@ -30,34 +30,80 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/**
- * @file
- * String typedefs for common character types.
+#include "list_wrapper.hpp"
+#include "unittest.hpp"
+
+#include <libpmemobj++/make_persistent.hpp>
+#include <libpmemobj++/make_persistent_atomic.hpp>
+
+namespace nvobj = pmem::obj;
+using C = container_t<int>;
+
+struct root {
+	nvobj::persistent_ptr<C> v;
+};
+
+/* Check if access method can be called out of transaction scope */
+void
+check_access_out_of_tx(nvobj::pool<struct root> &pop)
+{
+	auto r = pop.root();
+
+	try {
+		r->v->cdata();
+		r->v->data();
+		static_cast<const C &>(*r->v).data();
+	} catch (std::exception &e) {
+		UT_FATALexc(e);
+	}
+}
+
+/*
+ * Check if access methods, iterators and dereference operator add
+ * elements to transaction. Expect no pmemcheck errors.
  */
-
-#ifndef LIBPMEMOBJ_CPP_STRING_HPP
-#define LIBPMEMOBJ_CPP_STRING_HPP
-
-#include <libpmemobj++/experimental/basic_string.hpp>
-
-namespace pmem
+void
+check_add_to_tx(nvobj::pool<struct root> &pop)
 {
+	auto r = pop.root();
 
-namespace obj
+	try {
+		nvobj::transaction::run(pop, [&] {
+			auto p = r->v->data();
+			for (unsigned i = 0; i < r->v->size(); ++i)
+				*(p + i) = 2;
+		});
+	} catch (std::exception &e) {
+		UT_FATALexc(e);
+	}
+}
+
+int
+main(int argc, char *argv[])
 {
+	START();
 
-namespace experimental
-{
+	if (argc < 2) {
+		std::cerr << "usage: " << argv[0] << " file-name" << std::endl;
+		return 1;
+	}
 
-using string = basic_string<char>;
-using wstring = basic_string<wchar_t>;
-using u16string = basic_string<char16_t>;
-using u32string = basic_string<char32_t>;
+	auto path = argv[1];
+	auto pop =
+		nvobj::pool<root>::create(path, "VectorTest: iterators",
+					  PMEMOBJ_MIN_POOL, S_IWUSR | S_IRUSR);
 
-} /* namespace experimental */
+	auto r = pop.root();
 
-} /* namespace obj */
+	nvobj::transaction::run(
+		pop, [&] { r->v = nvobj::make_persistent<C>(10U, 1); });
 
-} /* namespace pmem */
+	check_access_out_of_tx(pop);
+	check_add_to_tx(pop);
 
-#endif /* LIBPMEMOBJ_CPP_STRING_HPP */
+	nvobj::delete_persistent_atomic<C>(r->v);
+
+	pop.close();
+
+	return 0;
+}

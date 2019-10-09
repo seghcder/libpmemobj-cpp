@@ -41,13 +41,13 @@
 #include <algorithm>
 #include <functional>
 
+#include <libpmemobj++/container/detail/contiguous_iterator.hpp>
 #include <libpmemobj++/detail/common.hpp>
-#include <libpmemobj++/experimental/contiguous_iterator.hpp>
-#include <libpmemobj++/experimental/slice.hpp>
 #include <libpmemobj++/persistent_ptr.hpp>
 #include <libpmemobj++/pext.hpp>
+#include <libpmemobj++/slice.hpp>
 #include <libpmemobj++/transaction.hpp>
-#include <libpmemobj.h>
+#include <libpmemobj/base.h>
 
 namespace pmem
 {
@@ -55,14 +55,10 @@ namespace pmem
 namespace obj
 {
 
-namespace experimental
-{
-
 /**
- * pmem::obj::experimental::array - EXPERIMENTAL persistent container
- * with std::array compatible interface.
+ * pmem::obj::array - persistent container with std::array compatible interface.
  *
- * pmem::obj::experimental::array can only be stored on pmem. Creating array on
+ * pmem::obj::array can only be stored on pmem. Creating array on
  * stack will result with "pool_error" exception.
  *
  * All methods which allow write access to specific element will add it to an
@@ -100,12 +96,14 @@ struct array {
 	using const_pointer = const value_type *;
 	using reference = value_type &;
 	using const_reference = const value_type &;
-	using iterator = basic_contiguous_iterator<T>;
+	using iterator = pmem::detail::basic_contiguous_iterator<T>;
 	using const_iterator = const_pointer;
 	using size_type = std::size_t;
 	using difference_type = std::ptrdiff_t;
 	using reverse_iterator = std::reverse_iterator<iterator>;
 	using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+	using range_snapshotting_iterator =
+		pmem::detail::range_snapshotting_iterator<T>;
 
 	/* Underlying array */
 	typename standard_array_traits<T, N>::type _data;
@@ -122,12 +120,15 @@ struct array {
 
 	/**
 	 * Defaulted move constructor.
+	 *
+	 * Performs member-wise move but do NOT add moved-from array to the
+	 * transaction.
 	 */
 	array(array &&) = default;
 
 	/**
 	 * Copy assignment operator - perform assignment from other
-	 * pmem::obj::experimental::array.
+	 * pmem::obj::array.
 	 *
 	 * This function creates a transaction internally.
 	 *
@@ -148,7 +149,8 @@ struct array {
 			return *this;
 
 		transaction::run(pop, [&] {
-			detail::conditional_add_to_tx(this);
+			detail::conditional_add_to_tx(
+				this, 1, POBJ_XADD_ASSUME_INITIALIZED);
 			std::copy(other.cbegin(), other.cend(), _get_data());
 		});
 
@@ -157,7 +159,7 @@ struct array {
 
 	/**
 	 * Move assignment operator - perform move assignment from other
-	 * pmem::obj::experimental::array.
+	 * pmem::obj::array.
 	 *
 	 * This function creates a transaction internally.
 	 *
@@ -178,8 +180,12 @@ struct array {
 			return *this;
 
 		transaction::run(pop, [&] {
-			detail::conditional_add_to_tx(this);
-			std::copy(other.cbegin(), other.cend(), _get_data());
+			detail::conditional_add_to_tx(
+				this, 1, POBJ_XADD_ASSUME_INITIALIZED);
+			detail::conditional_add_to_tx(
+				&other, 1, POBJ_XADD_ASSUME_INITIALIZED);
+			std::move(other._get_data(), other._get_data() + size(),
+				  _get_data());
 		});
 
 		return *this;
@@ -198,7 +204,8 @@ struct array {
 		if (n >= N)
 			throw std::out_of_range("array::at");
 
-		detail::conditional_add_to_tx(_get_data() + n);
+		detail::conditional_add_to_tx(_get_data() + n, 1,
+					      POBJ_XADD_ASSUME_INITIALIZED);
 
 		return _get_data()[n];
 	}
@@ -240,7 +247,8 @@ struct array {
 	 */
 	reference operator[](size_type n)
 	{
-		detail::conditional_add_to_tx(_get_data() + n);
+		detail::conditional_add_to_tx(_get_data() + n, 1,
+					      POBJ_XADD_ASSUME_INITIALIZED);
 
 		return _get_data()[n];
 	}
@@ -264,7 +272,8 @@ struct array {
 	T *
 	data()
 	{
-		detail::conditional_add_to_tx(this);
+		detail::conditional_add_to_tx(this, 1,
+					      POBJ_XADD_ASSUME_INITIALIZED);
 		return _get_data();
 	}
 
@@ -415,7 +424,8 @@ struct array {
 	reference
 	front()
 	{
-		detail::conditional_add_to_tx(_get_data());
+		detail::conditional_add_to_tx(_get_data(), 1,
+					      POBJ_XADD_ASSUME_INITIALIZED);
 		return _get_data()[0];
 	}
 
@@ -428,7 +438,8 @@ struct array {
 	reference
 	back()
 	{
-		detail::conditional_add_to_tx(&_get_data()[size() - 1]);
+		detail::conditional_add_to_tx(&_get_data()[size() - 1], 1,
+					      POBJ_XADD_ASSUME_INITIALIZED);
 		return _get_data()[size() - 1];
 	}
 
@@ -485,7 +496,8 @@ struct array {
 		if (start + n > N)
 			throw std::out_of_range("array::range");
 
-		detail::conditional_add_to_tx(_get_data() + start, n);
+		detail::conditional_add_to_tx(_get_data() + start, n,
+					      POBJ_XADD_ASSUME_INITIALIZED);
 
 		return {_get_data() + start, _get_data() + start + n};
 	}
@@ -506,7 +518,7 @@ struct array {
 	 * @throw std::out_of_range if any element of the range would be
 	 *	outside of the array.
 	 */
-	slice<range_snapshotting_iterator<T>>
+	slice<range_snapshotting_iterator>
 	range(size_type start, size_type n, size_type snapshot_size)
 	{
 		if (start + n > N)
@@ -515,12 +527,12 @@ struct array {
 		if (snapshot_size > n)
 			snapshot_size = n;
 
-		return {range_snapshotting_iterator<T>(_get_data() + start,
-						       _get_data() + start, n,
-						       snapshot_size),
-			range_snapshotting_iterator<T>(_get_data() + start + n,
-						       _get_data() + start, n,
-						       snapshot_size)};
+		return {range_snapshotting_iterator(_get_data() + start,
+						    _get_data() + start, n,
+						    snapshot_size),
+			range_snapshotting_iterator(_get_data() + start + n,
+						    _get_data() + start, n,
+						    snapshot_size)};
 	}
 
 	/**
@@ -605,7 +617,8 @@ struct array {
 		auto pop = _get_pool();
 
 		transaction::run(pop, [&] {
-			detail::conditional_add_to_tx(this);
+			detail::conditional_add_to_tx(
+				this, 1, POBJ_XADD_ASSUME_INITIALIZED);
 			std::fill(_get_data(), _get_data() + size(), value);
 		});
 	}
@@ -631,8 +644,10 @@ struct array {
 			return;
 
 		transaction::run(pop, [&] {
-			detail::conditional_add_to_tx(this);
-			detail::conditional_add_to_tx(&other);
+			detail::conditional_add_to_tx(
+				this, 1, POBJ_XADD_ASSUME_INITIALIZED);
+			detail::conditional_add_to_tx(
+				&other, 1, POBJ_XADD_ASSUME_INITIALIZED);
 
 			std::swap_ranges(_get_data(), _get_data() + size(),
 					 other._get_data());
@@ -774,8 +789,8 @@ operator<=(const array<T, N> &lhs, const array<T, N> &rhs)
  * Non-member cbegin.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_iterator
-cbegin(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_iterator
+cbegin(const pmem::obj::array<T, N> &a)
 {
 	return a.cbegin();
 }
@@ -784,8 +799,8 @@ cbegin(const pmem::obj::experimental::array<T, N> &a)
  * Non-member cend.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_iterator
-cend(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_iterator
+cend(const pmem::obj::array<T, N> &a)
 {
 	return a.cend();
 }
@@ -794,8 +809,8 @@ cend(const pmem::obj::experimental::array<T, N> &a)
  * Non-member crbegin.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_reverse_iterator
-crbegin(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_reverse_iterator
+crbegin(const pmem::obj::array<T, N> &a)
 {
 	return a.crbegin();
 }
@@ -804,8 +819,8 @@ crbegin(const pmem::obj::experimental::array<T, N> &a)
  * Non-member crend.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_reverse_iterator
-crend(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_reverse_iterator
+crend(const pmem::obj::array<T, N> &a)
 {
 	return a.crend();
 }
@@ -814,8 +829,8 @@ crend(const pmem::obj::experimental::array<T, N> &a)
  * Non-member begin.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::iterator
-begin(pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::iterator
+begin(pmem::obj::array<T, N> &a)
 {
 	return a.begin();
 }
@@ -824,8 +839,8 @@ begin(pmem::obj::experimental::array<T, N> &a)
  * Non-member begin.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_iterator
-begin(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_iterator
+begin(const pmem::obj::array<T, N> &a)
 {
 	return a.begin();
 }
@@ -834,8 +849,8 @@ begin(const pmem::obj::experimental::array<T, N> &a)
  * Non-member end.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::iterator
-end(pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::iterator
+end(pmem::obj::array<T, N> &a)
 {
 	return a.end();
 }
@@ -844,8 +859,8 @@ end(pmem::obj::experimental::array<T, N> &a)
  * Non-member end.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_iterator
-end(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_iterator
+end(const pmem::obj::array<T, N> &a)
 {
 	return a.end();
 }
@@ -854,8 +869,8 @@ end(const pmem::obj::experimental::array<T, N> &a)
  * Non-member rbegin.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::reverse_iterator
-rbegin(pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::reverse_iterator
+rbegin(pmem::obj::array<T, N> &a)
 {
 	return a.rbegin();
 }
@@ -864,8 +879,8 @@ rbegin(pmem::obj::experimental::array<T, N> &a)
  * Non-member rbegin.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_reverse_iterator
-rbegin(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_reverse_iterator
+rbegin(const pmem::obj::array<T, N> &a)
 {
 	return a.rbegin();
 }
@@ -874,8 +889,8 @@ rbegin(const pmem::obj::experimental::array<T, N> &a)
  * Non-member rend.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::reverse_iterator
-rend(pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::reverse_iterator
+rend(pmem::obj::array<T, N> &a)
 {
 	return a.rend();
 }
@@ -884,8 +899,8 @@ rend(pmem::obj::experimental::array<T, N> &a)
  * Non-member rend.
  */
 template <typename T, std::size_t N>
-typename pmem::obj::experimental::array<T, N>::const_reverse_iterator
-rend(const pmem::obj::experimental::array<T, N> &a)
+typename pmem::obj::array<T, N>::const_reverse_iterator
+rend(const pmem::obj::array<T, N> &a)
 {
 	return a.rend();
 }
@@ -895,8 +910,7 @@ rend(const pmem::obj::experimental::array<T, N> &a)
  */
 template <typename T, size_t N>
 inline void
-swap(pmem::obj::experimental::array<T, N> &lhs,
-     pmem::obj::experimental::array<T, N> &rhs)
+swap(pmem::obj::array<T, N> &lhs, pmem::obj::array<T, N> &rhs)
 {
 	lhs.swap(rhs);
 }
@@ -906,7 +920,7 @@ swap(pmem::obj::experimental::array<T, N> &lhs,
  */
 template <size_t I, typename T, size_t N>
 T &
-get(pmem::obj::experimental::array<T, N> &a)
+get(pmem::obj::array<T, N> &a)
 {
 	static_assert(I < N,
 		      "Index out of bounds in std::get<> (pmem::obj::array)");
@@ -918,7 +932,7 @@ get(pmem::obj::experimental::array<T, N> &a)
  */
 template <size_t I, typename T, size_t N>
 T &&
-get(pmem::obj::experimental::array<T, N> &&a)
+get(pmem::obj::array<T, N> &&a)
 {
 	static_assert(I < N,
 		      "Index out of bounds in std::get<> (pmem::obj::array)");
@@ -930,7 +944,7 @@ get(pmem::obj::experimental::array<T, N> &&a)
  */
 template <size_t I, typename T, size_t N>
 const T &
-get(const pmem::obj::experimental::array<T, N> &a) noexcept
+get(const pmem::obj::array<T, N> &a) noexcept
 {
 	static_assert(I < N,
 		      "Index out of bounds in std::get<> (pmem::obj::array)");
@@ -942,14 +956,12 @@ get(const pmem::obj::experimental::array<T, N> &a) noexcept
  */
 template <size_t I, typename T, size_t N>
 const T &&
-get(const pmem::obj::experimental::array<T, N> &&a) noexcept
+get(const pmem::obj::array<T, N> &&a) noexcept
 {
 	static_assert(I < N,
 		      "Index out of bounds in std::get<> (pmem::obj::array)");
 	return std::move(a.at(I));
 }
-
-} /* namespace experimental */
 
 } /* namespace obj */
 

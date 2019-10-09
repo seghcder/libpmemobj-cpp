@@ -38,17 +38,17 @@
 #ifndef LIBPMEMOBJ_CPP_VECTOR_HPP
 #define LIBPMEMOBJ_CPP_VECTOR_HPP
 
+#include <libpmemobj++/container/detail/contiguous_iterator.hpp>
 #include <libpmemobj++/detail/common.hpp>
 #include <libpmemobj++/detail/iterator_traits.hpp>
 #include <libpmemobj++/detail/life.hpp>
 #include <libpmemobj++/detail/temp_value.hpp>
-#include <libpmemobj++/experimental/contiguous_iterator.hpp>
-#include <libpmemobj++/experimental/slice.hpp>
 #include <libpmemobj++/make_persistent.hpp>
 #include <libpmemobj++/persistent_ptr.hpp>
 #include <libpmemobj++/pext.hpp>
+#include <libpmemobj++/slice.hpp>
 #include <libpmemobj++/transaction.hpp>
-#include <libpmemobj.h>
+#include <libpmemobj/base.h>
 
 #include <algorithm>
 #include <cassert>
@@ -61,12 +61,9 @@ namespace pmem
 namespace obj
 {
 
-namespace experimental
-{
-
 /**
- * pmem::obj::experimental::vector - EXPERIMENTAL persistent container
- * with std::vector compatible interface.
+ * pmem::obj::vector - persistent container with std::vector compatible
+ * interface.
  */
 template <typename T>
 class vector {
@@ -79,10 +76,12 @@ public:
 	using const_reference = const value_type &;
 	using pointer = value_type *;
 	using const_pointer = const value_type *;
-	using iterator = basic_contiguous_iterator<T>;
+	using iterator = pmem::detail::basic_contiguous_iterator<T>;
 	using const_iterator = const_pointer;
 	using reverse_iterator = std::reverse_iterator<iterator>;
 	using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+	using range_snapshotting_iterator =
+		pmem::detail::range_snapshotting_iterator<T>;
 
 	/* Constructors */
 	vector();
@@ -151,8 +150,8 @@ public:
 
 	/* Range */
 	slice<pointer> range(size_type start, size_type n);
-	slice<range_snapshotting_iterator<T>>
-	range(size_type start, size_type n, size_type snapshot_size);
+	slice<range_snapshotting_iterator> range(size_type start, size_type n,
+						 size_type snapshot_size);
 	slice<const_iterator> range(size_type start, size_type n) const;
 	slice<const_iterator> crange(size_type start, size_type n) const;
 
@@ -190,29 +189,85 @@ public:
 	void swap(vector &other);
 
 private:
+	/* helper iterator */
+	template <typename P>
+	struct single_element_iterator {
+		using iterator_category = std::input_iterator_tag;
+		using value_type = P;
+		using difference_type = std::ptrdiff_t;
+		using pointer = const P *;
+		using reference = const P &;
+
+		const P *ptr;
+		std::size_t count;
+
+		single_element_iterator(const P *ptr, std::size_t count = 0)
+		    : ptr(ptr), count(count)
+		{
+		}
+
+		reference operator*()
+		{
+			return *ptr;
+		}
+
+		pointer operator->()
+		{
+			return ptr;
+		}
+
+		single_element_iterator &
+		operator++()
+		{
+			count++;
+			return *this;
+		}
+
+		single_element_iterator
+		operator++(int)
+		{
+			single_element_iterator tmp =
+				single_element_iterator(ptr, count);
+			count++;
+			return tmp;
+		}
+
+		difference_type
+		operator-(const single_element_iterator &rhs)
+		{
+			return count - rhs.count;
+		}
+
+		bool
+		operator!=(const single_element_iterator &rhs)
+		{
+			return ptr != rhs.ptr || count != rhs.count;
+		}
+	};
+
 	/* helper functions */
 	void alloc(size_type size);
 	void check_pmem();
 	void check_tx_stage_work();
 	template <typename... Args>
-	void construct(size_type idx, size_type count, Args &&... args);
+	void construct_at_end(size_type count, Args &&... args);
 	template <typename InputIt,
 		  typename std::enable_if<
 			  detail::is_input_iterator<InputIt>::value,
 			  InputIt>::type * = nullptr>
-	void construct_range(size_type idx, InputIt first, InputIt last);
-	template <typename InputIt,
-		  typename std::enable_if<
-			  detail::is_input_iterator<InputIt>::value,
-			  InputIt>::type * = nullptr>
-	void construct_range_copy(size_type idx, InputIt first, InputIt last);
+	void construct_at_end(InputIt first, InputIt last);
 	void dealloc();
 	pool_base get_pool() const noexcept;
-	void insert_gap(size_type idx, size_type count);
+	template <typename InputIt>
+	void internal_insert(size_type idx, InputIt first, InputIt last);
 	void realloc(size_type size);
 	size_type get_recommended_capacity(size_type at_least) const;
 	void shrink(size_type size_new);
-	void snapshot_data(size_type idx_first, size_type idx_last);
+	void add_data_to_tx(size_type idx_first, size_type num);
+	template <typename InputIt>
+	void construct_or_assign(size_type idx, InputIt first, InputIt last);
+	void move_elements_backward(pointer first, pointer last,
+				    pointer d_last);
 
 	p<size_type> _size;
 	p<size_type> _capacity;
@@ -226,8 +281,8 @@ template <typename T>
 void swap(vector<T> &lhs, vector<T> &rhs);
 
 /*
- * Comparison operators between pmem::obj::experimental::vector<T> and
- * pmem::obj::experimental::vector<T>
+ * Comparison operators between pmem::obj::vector<T> and
+ * pmem::obj::vector<T>
  */
 template <typename T>
 bool operator==(const vector<T> &lhs, const vector<T> &rhs);
@@ -243,7 +298,7 @@ template <typename T>
 bool operator>=(const vector<T> &lhs, const vector<T> &rhs);
 
 /*
- * Comparison operators between pmem::obj::experimental::vector<T> and
+ * Comparison operators between pmem::obj::vector<T> and
  * std::vector<T>
  */
 template <typename T>
@@ -261,7 +316,7 @@ bool operator>=(const vector<T> &lhs, const std::vector<T> &rhs);
 
 /*
  * Comparison operators between std::vector<T> and
- * pmem::obj::experimental::vector<T>
+ * pmem::obj::vector<T>
  */
 template <typename T>
 bool operator==(const std::vector<T> &lhs, const vector<T> &rhs);
@@ -323,7 +378,7 @@ vector<T>::vector(size_type count, const value_type &value)
 	_data = nullptr;
 	_size = 0;
 	alloc(count);
-	construct(0, count, value);
+	construct_at_end(count, value);
 }
 
 /**
@@ -352,7 +407,7 @@ vector<T>::vector(size_type count)
 	_data = nullptr;
 	_size = 0;
 	alloc(count);
-	construct(0, count);
+	construct_at_end(count);
 }
 
 /**
@@ -389,7 +444,7 @@ vector<T>::vector(InputIt first, InputIt last)
 	_data = nullptr;
 	_size = 0;
 	alloc(static_cast<size_type>(std::distance(first, last)));
-	construct_range_copy(0, first, last);
+	construct_at_end(first, last);
 }
 
 /**
@@ -419,7 +474,7 @@ vector<T>::vector(const vector &other)
 	_data = nullptr;
 	_size = 0;
 	alloc(other.capacity());
-	construct_range_copy(0, other.cbegin(), other.cend());
+	construct_at_end(other.cbegin(), other.cend());
 }
 
 /**
@@ -610,7 +665,7 @@ vector<T>::assign(size_type count, const_reference value)
 			 * elements destructors, or append more new elements.
 			 */
 			size_type size_old = _size;
-			snapshot_data(0, size_old);
+			add_data_to_tx(0, size_old);
 
 			std::fill_n(
 				&_data[0],
@@ -619,38 +674,15 @@ vector<T>::assign(size_type count, const_reference value)
 				value);
 
 			if (count > size_old) {
-#if LIBPMEMOBJ_CPP_VG_PMEMCHECK_ENABLED
-				/*
-				 * Range of memory:
-				 * [&_data[size_old], &_data[count])
-				 * is undefined, there is no need to snapshot
-				 * and eventually rollback old data.
-				 */
-				VALGRIND_PMC_ADD_TO_TX(
-					&_data[static_cast<difference_type>(
-						size_old)],
-					sizeof(T) * (count - size_old));
-#endif
-
-				construct(size_old, count - size_old, value);
-				/*
-				 * XXX: explicit persist is required here
-				 * because given range wasn't snapshotted and
-				 * won't be persisted automatically on tx
-				 * commit. This can be changed once we will have
-				 * implemented "uninitialized" flag for
-				 * pmemobj_tx_xadd in libpmemobj.
-				 */
-				pb.persist(&_data[static_cast<difference_type>(
-						   size_old)],
-					   sizeof(T) * (count - size_old));
+				add_data_to_tx(size_old, count - size_old);
+				construct_at_end(count - size_old, value);
 			} else {
 				shrink(count);
 			}
 		} else {
 			dealloc();
 			alloc(count);
-			construct(0, count, value);
+			construct_at_end(count, value);
 		}
 	});
 }
@@ -693,24 +725,13 @@ vector<T>::assign(InputIt first, InputIt last)
 			 * elements destructors, or append more new elements.
 			 */
 			size_type size_old = _size;
-			snapshot_data(0, size_old);
+			add_data_to_tx(0, size_old);
 
 			InputIt mid = last;
 			bool growing = size_new > size_old;
 
 			if (growing) {
-#if LIBPMEMOBJ_CPP_VG_PMEMCHECK_ENABLED
-				/*
-				 * Range of memory:
-				 * [&_data[size_old], &_data[size_new])
-				 * is undefined, there is no need to snapshot
-				 * and eventually rollback old data.
-				 */
-				VALGRIND_PMC_ADD_TO_TX(
-					&_data[static_cast<difference_type>(
-						size_old)],
-					sizeof(T) * (size_new - size_old));
-#endif
+				add_data_to_tx(size_old, size_new - size_old);
 
 				mid = first;
 				std::advance(mid, size_old);
@@ -719,18 +740,7 @@ vector<T>::assign(InputIt first, InputIt last)
 			iterator shrink_to = std::copy(first, mid, &_data[0]);
 
 			if (growing) {
-				construct_range_copy(size_old, mid, last);
-				/*
-				 * XXX: explicit persist is required here
-				 * because given range wasn't snapshotted and
-				 * won't be persisted automatically on tx
-				 * commit. This can be changed once we will have
-				 * implemented "uninitialized" flag for
-				 * pmemobj_tx_xadd in libpmemobj.
-				 */
-				pb.persist(&_data[static_cast<difference_type>(
-						   size_old)],
-					   sizeof(T) * (size_new - size_old));
+				construct_at_end(mid, last);
 			} else {
 				shrink(static_cast<size_type>(std::distance(
 					iterator(&_data[0]), shrink_to)));
@@ -738,7 +748,7 @@ vector<T>::assign(InputIt first, InputIt last)
 		} else {
 			dealloc();
 			alloc(size_new);
-			construct_range_copy(0, first, last);
+			construct_at_end(first, last);
 		}
 	});
 }
@@ -869,7 +879,8 @@ vector<T>::at(size_type n)
 	if (n >= _size)
 		throw std::out_of_range("vector::at");
 
-	detail::conditional_add_to_tx(&_data[static_cast<difference_type>(n)]);
+	detail::conditional_add_to_tx(&_data[static_cast<difference_type>(n)],
+				      1, POBJ_XADD_ASSUME_INITIALIZED);
 
 	return _data[static_cast<difference_type>(n)];
 }
@@ -929,7 +940,8 @@ vector<T>::const_at(size_type n) const
 template <typename T>
 typename vector<T>::reference vector<T>::operator[](size_type n)
 {
-	detail::conditional_add_to_tx(&_data[static_cast<difference_type>(n)]);
+	detail::conditional_add_to_tx(&_data[static_cast<difference_type>(n)],
+				      1, POBJ_XADD_ASSUME_INITIALIZED);
 
 	return _data[static_cast<difference_type>(n)];
 }
@@ -959,7 +971,8 @@ template <typename T>
 typename vector<T>::reference
 vector<T>::front()
 {
-	detail::conditional_add_to_tx(&_data[0]);
+	detail::conditional_add_to_tx(&_data[0], 1,
+				      POBJ_XADD_ASSUME_INITIALIZED);
 
 	return _data[0];
 }
@@ -1003,7 +1016,8 @@ typename vector<T>::reference
 vector<T>::back()
 {
 	detail::conditional_add_to_tx(
-		&_data[static_cast<difference_type>(size() - 1)]);
+		&_data[static_cast<difference_type>(size() - 1)], 1,
+		POBJ_XADD_ASSUME_INITIALIZED);
 
 	return _data[static_cast<difference_type>(size() - 1)];
 }
@@ -1047,7 +1061,7 @@ template <typename T>
 typename vector<T>::value_type *
 vector<T>::data()
 {
-	snapshot_data(0, _size);
+	add_data_to_tx(0, _size);
 
 	return _data.get();
 }
@@ -1253,7 +1267,8 @@ vector<T>::range(size_type start, size_type n)
 	if (start + n > size())
 		throw std::out_of_range("vector::range");
 
-	detail::conditional_add_to_tx(cdata() + start, n);
+	detail::conditional_add_to_tx(cdata() + start, n,
+				      POBJ_XADD_ASSUME_INITIALIZED);
 
 	return {_data.get() + start, _data.get() + start + n};
 }
@@ -1274,7 +1289,7 @@ vector<T>::range(size_type start, size_type n)
  * vector.
  */
 template <typename T>
-slice<range_snapshotting_iterator<T>>
+slice<typename vector<T>::range_snapshotting_iterator>
 vector<T>::range(size_type start, size_type n, size_type snapshot_size)
 {
 	if (start + n > size())
@@ -1283,12 +1298,12 @@ vector<T>::range(size_type start, size_type n, size_type snapshot_size)
 	if (snapshot_size > n)
 		snapshot_size = n;
 
-	return {range_snapshotting_iterator<T>(_data.get() + start,
-					       _data.get() + start, n,
-					       snapshot_size),
-		range_snapshotting_iterator<T>(_data.get() + start + n,
-					       _data.get() + start, n,
-					       snapshot_size)};
+	return {range_snapshotting_iterator(_data.get() + start,
+					    _data.get() + start, n,
+					    snapshot_size),
+		range_snapshotting_iterator(_data.get() + start + n,
+					    _data.get() + start, n,
+					    snapshot_size)};
 }
 
 /**
@@ -1536,8 +1551,8 @@ vector<T>::insert(const_iterator pos, value_type &&value)
 	size_type idx = static_cast<size_type>(std::distance(cbegin(), pos));
 
 	transaction::run(pb, [&] {
-		insert_gap(idx, 1);
-		construct(idx, 1, std::move(value));
+		internal_insert(idx, std::make_move_iterator(&value),
+				std::make_move_iterator(&value + 1));
 	});
 
 	return iterator(&_data[static_cast<difference_type>(idx)]);
@@ -1580,8 +1595,9 @@ vector<T>::insert(const_iterator pos, size_type count, const value_type &value)
 	size_type idx = static_cast<size_type>(std::distance(cbegin(), pos));
 
 	transaction::run(pb, [&] {
-		insert_gap(idx, count);
-		construct(idx, count, value);
+		internal_insert(
+			idx, single_element_iterator<value_type>(&value, 0),
+			single_element_iterator<value_type>(&value, count));
 	});
 
 	return iterator(&_data[static_cast<difference_type>(idx)]);
@@ -1631,12 +1647,8 @@ vector<T>::insert(const_iterator pos, InputIt first, InputIt last)
 	pool_base pb = get_pool();
 
 	size_type idx = static_cast<size_type>(std::distance(cbegin(), pos));
-	size_type gap_size = static_cast<size_type>(std::distance(first, last));
 
-	transaction::run(pb, [&] {
-		insert_gap(idx, gap_size);
-		construct_range_copy(idx, first, last);
-	});
+	transaction::run(pb, [&] { internal_insert(idx, first, last); });
 
 	return iterator(&_data[static_cast<difference_type>(idx)]);
 }
@@ -1715,15 +1727,17 @@ vector<T>::emplace(const_iterator pos, Args &&... args)
 	transaction::run(pb, [&] {
 		/*
 		 * args might be a reference to underlying array element. This
-		 * reference can be invalidated after insert_gap() call. Hence,
-		 * we must cache value_type object in temp_value.
+		 * reference can be invalidated after internal_insert() call.
+		 * Hence, we must cache value_type object in temp_value.
 		 */
 		detail::temp_value<value_type,
 				   noexcept(T(std::forward<Args>(args)...))>
 		tmp(std::forward<Args>(args)...);
 
-		insert_gap(idx, 1);
-		construct(idx, 1, std::move(tmp.get()));
+		auto &tmp_ref = tmp.get();
+
+		internal_insert(idx, std::make_move_iterator(&tmp_ref),
+				std::make_move_iterator(&tmp_ref + 1));
 	});
 
 	return iterator(&_data[static_cast<difference_type>(idx)]);
@@ -1767,27 +1781,10 @@ vector<T>::emplace_back(Args &&... args)
 		if (_size == _capacity) {
 			realloc(get_recommended_capacity(_size + 1));
 		} else {
-#if LIBPMEMOBJ_CPP_VG_PMEMCHECK_ENABLED
-			/*
-			 * Range of memory: [&_data[_size], &_data[_size + 1])
-			 * is undefined, there is no need to snapshot and
-			 * eventually rollback old data.
-			 */
-			VALGRIND_PMC_ADD_TO_TX(
-				&_data[static_cast<difference_type>(size())],
-				sizeof(T));
-#endif
+			add_data_to_tx(size(), 1);
 		}
 
-		construct(size(), 1, std::forward<Args>(args)...);
-		/*
-		 * XXX: explicit persist is required here because given range
-		 * wasn't snapshotted and won't be persisted automatically on tx
-		 * commit. This can be changed once we will have implemented
-		 * "uninitialized" flag for pmemobj_tx_xadd in libpmemobj.
-		 */
-		pb.persist(&_data[static_cast<difference_type>(size() - 1)],
-			   sizeof(T));
+		construct_at_end(1, std::forward<Args>(args)...);
 	});
 
 	return back();
@@ -1859,7 +1856,7 @@ vector<T>::erase(const_iterator first, const_iterator last)
 		 * XXX: future optimization: no need to snapshot trivial types,
 		 * if idx + count = _size
 		 */
-		snapshot_data(idx, _size);
+		add_data_to_tx(idx, _size - idx);
 
 		pointer move_begin =
 			&_data[static_cast<difference_type>(idx + count)];
@@ -1967,7 +1964,7 @@ vector<T>::resize(size_type count)
 		else {
 			if (_capacity < count)
 				realloc(count);
-			construct(_size, count - _size);
+			construct_at_end(count - _size);
 		}
 	});
 }
@@ -2003,7 +2000,7 @@ vector<T>::resize(size_type count, const value_type &value)
 		else {
 			if (_capacity < count)
 				realloc(count);
-			construct(_size, count - _size, value);
+			construct_at_end(count - _size, value);
 		}
 	});
 }
@@ -2111,10 +2108,9 @@ vector<T>::check_tx_stage_work()
 
 /**
  * Private helper function. Must be called during transaction. Assumes that
- * there is free space for additional elements. Constructs elements at given
- * index in underlying array based on given parameters.
+ * there is free space for additional elements. Constructs elements at
+ * index size() in underlying array based on given parameters.
  *
- * @param[in] idx underyling array index where new elements will be constructed.
  * @param[in] count number of elements to be constructed.
  * @param[in] args variadic template arguments for value_type constructor.
  *
@@ -2131,12 +2127,12 @@ vector<T>::check_tx_stage_work()
 template <typename T>
 template <typename... Args>
 void
-vector<T>::construct(size_type idx, size_type count, Args &&... args)
+vector<T>::construct_at_end(size_type count, Args &&... args)
 {
 	assert(pmemobj_tx_stage() == TX_STAGE_WORK);
 	assert(_capacity >= count + _size);
 
-	pointer dest = _data.get() + idx;
+	pointer dest = _data.get() + size();
 	const_pointer end = dest + count;
 	for (; dest != end; ++dest)
 		detail::create<value_type, Args...>(
@@ -2147,11 +2143,10 @@ vector<T>::construct(size_type idx, size_type count, Args &&... args)
 /**
  * Private helper function. Must be called during transaction. Assumes that
  * there is free space for additional elements and input arguments satisfy
- * InputIterator requirements. Moves elements at index idx in underlying array
- * with the contents of the range [first, last). This overload participates in
- * overload resolution only if InputIt satisfies InputIterator.
+ * InputIterator requirements. Copies elements at index size() in underlying
+ * array with the contents of the range [first, last). This overload
+ * participates in overload resolution only if InputIt satisfies InputIterator.
  *
- * @param[in] idx underyling array index where new elements will be moved.
  * @param[in] first first iterator.
  * @param[in] last last iterator.
  *
@@ -2160,7 +2155,7 @@ vector<T>::construct(size_type idx, size_type count, Args &&... args)
  * be snapshotted in current transaction.
  * @pre capacity() >= std::distance(first, last) + size()
  * @pre InputIt is InputIterator.
- * @pre std::move(InputIt::reference) is valid argument for value_type
+ * @pre InputIt::reference is valid argument for value_type
  * constructor.
  *
  * @post size() == size() + std::distance(first, last)
@@ -2172,54 +2167,15 @@ template <typename InputIt,
 	  typename std::enable_if<detail::is_input_iterator<InputIt>::value,
 				  InputIt>::type *>
 void
-vector<T>::construct_range(size_type idx, InputIt first, InputIt last)
+vector<T>::construct_at_end(InputIt first, InputIt last)
 {
 	assert(pmemobj_tx_stage() == TX_STAGE_WORK);
 	difference_type range_size = std::distance(first, last);
 	assert(range_size >= 0);
 	assert(_capacity >= static_cast<size_type>(range_size) + _size);
 
-	pointer dest = _data.get() + idx;
+	pointer dest = _data.get() + size();
 	_size += static_cast<size_type>(range_size);
-	while (first != last)
-		detail::create<value_type>(dest++, std::move(*first++));
-}
-
-/**
- * Private helper function. Must be called during transaction. Assumes that
- * there is free space for additional elements and input arguments satisfy
- * InputIterator requirements. Copy-constructs elements before pos in underlying
- * array with the contents of the range [first, last).
- *
- * @param[in] idx underyling array index where new elements will be constructed.
- * @param[in] first first iterator.
- * @param[in] last last iterator.
- *
- * @pre must be called in transaction scope.
- * @pre if initialized, range [end(), end() + std::distance(first, last)) must
- * be snapshotted in current transaction.
- * @pre capacity() >= std::distance(first, last) + size()
- * @pre InputIt is InputIterator.
- * @pre InputIt::reference is valid argument for value_type copy constructor.
- *
- * @post size() == size() + std::distance(first, last)
- *
- * @throw rethrows constructor exception.
- */
-template <typename T>
-template <typename InputIt,
-	  typename std::enable_if<detail::is_input_iterator<InputIt>::value,
-				  InputIt>::type *>
-void
-vector<T>::construct_range_copy(size_type idx, InputIt first, InputIt last)
-{
-	assert(pmemobj_tx_stage() == TX_STAGE_WORK);
-	difference_type diff = std::distance(first, last);
-	assert(diff >= 0);
-	assert(_capacity >= static_cast<size_type>(diff) + _size);
-
-	pointer dest = _data.get() + idx;
-	_size += static_cast<size_type>(diff);
 	while (first != last)
 		detail::create<value_type>(dest++, *first++);
 }
@@ -2273,12 +2229,62 @@ vector<T>::get_pool() const noexcept
 }
 
 /**
+ * Private helper function.
+ *
+ * It behaves similarly to std::move_backward but uses either
+ * copy constructor in case destination memory is not initialized
+ * or copy assignment operator otherwise.
+ */
+template <typename T>
+void
+vector<T>::move_elements_backward(pointer first, pointer last, pointer d_last)
+{
+	while (first != last && d_last >= cend())
+		detail::create<value_type>(--d_last, std::move(*(--last)));
+
+	if (first != last)
+		std::move_backward(first, last, d_last);
+}
+
+/**
+ * Private helper function.
+ *
+ * It behaves similarly to std::move_backward but uses either
+ * copy constructor in case destination memory is not initialized
+ * or copy assignment operator otherwise.
+ */
+template <typename T>
+template <typename InputIt>
+void
+vector<T>::construct_or_assign(size_type idx, InputIt first, InputIt last)
+{
+	auto count = static_cast<size_type>(std::distance(first, last));
+	auto dest = _data.get() + idx;
+	auto initialized_slots = static_cast<size_type>(cend() - dest);
+
+	/* Assign new elements to initialized memory */
+	if (dest < cend())
+		dest = std::copy_n(first, (std::min)(initialized_slots, count),
+				   dest);
+
+	std::advance(first, (std::min)(initialized_slots, count));
+
+	/* Rest of the elements will be created in uninitialized memory */
+	while (first != last)
+		detail::create<value_type>(dest++, *first++);
+
+	_size += count;
+}
+
+/**
  * Private helper function. Must be called during transaction. Inserts a gap for
  * count elements starting at index idx. If there is not enough space available,
- * reallocation occurs with new recommended size.
+ * reallocation occurs with new recommended size. Range specified by first, last
+ * is then inserted into the gap.
  *
- * param[in] idx index number where gap should be made.
- * param[in] count length (expressed in number of elements) of the gap.
+ * param[in] idx index number where insert should be made
+ * param[in] first iterator to beginning of the range to insert
+ * param[in] last iterator to end of the range to insert
  *
  * @pre must be called in transaction scope.
  *
@@ -2291,40 +2297,33 @@ vector<T>::get_pool() const noexcept
  * @throw pmem::transaction_free_error when freeing old underlying array failed.
  */
 template <typename T>
+template <typename InputIt>
 void
-vector<T>::insert_gap(size_type idx, size_type count)
+vector<T>::internal_insert(size_type idx, InputIt first, InputIt last)
 {
 	assert(pmemobj_tx_stage() == TX_STAGE_WORK);
 
-	if (_capacity >= _size + count) {
+	auto count = static_cast<size_type>(std::distance(first, last));
+
+	if (_capacity >= size() + count) {
 		pointer dest =
 			&_data[static_cast<difference_type>(size() + count)];
 		pointer begin = &_data[static_cast<difference_type>(idx)];
 		pointer end = &_data[static_cast<difference_type>(size())];
 
-		/*
-		 * XXX: There is no necessity to snapshot uninitialized data, so
-		 * we can optimize it by calling:
-		 * transaction::snapshot<T>(begin, size() - idx).
-		 * However, we need libpmemobj support for that, because right
-		 * now pmemcheck will report an error (uninitialized part of
-		 * data not added to tx).
-		 *
-		 * XXX: future optimization: we don't have to snapshot data
-		 * which we will not overwrite
-		 */
-#if LIBPMEMOBJ_CPP_VG_MEMCHECK_ENABLED
-		VALGRIND_MAKE_MEM_DEFINED(end, sizeof(T) * count);
-#endif
-		snapshot_data(idx, _size + count);
+		add_data_to_tx(idx, size() - idx + count);
 
-		std::move_backward(begin, end, dest);
+		/* Make a gap for new elements */
+		move_elements_backward(begin, end, dest);
+
+		/* Construct new elements in the gap */
+		construct_or_assign(idx, first, last);
 	} else {
 		/*
 		 * XXX: future optimization: we don't have to snapshot data
-		 * which we will not overwrite
+		 * which we will copy (only snapshot for move)
 		 */
-		snapshot_data(0, _size);
+		add_data_to_tx(0, _size);
 
 		auto old_data = _data;
 		auto old_size = _size;
@@ -2337,8 +2336,16 @@ vector<T>::insert_gap(size_type idx, size_type count)
 
 		alloc(get_recommended_capacity(old_size + count));
 
-		construct_range(0, old_begin, old_mid);
-		construct_range(idx + count, old_mid, old_end);
+		/* Move range before the idx to new array */
+		construct_at_end(std::make_move_iterator(old_begin),
+				 std::make_move_iterator(old_mid));
+
+		/* Insert (first, last) range to the new array */
+		construct_at_end(first, last);
+
+		/* Move remaining element ot the new array */
+		construct_at_end(std::make_move_iterator(old_mid),
+				 std::make_move_iterator(old_end));
 
 		/* destroy and free old data */
 		for (size_type i = 0; i < old_size; ++i)
@@ -2378,7 +2385,7 @@ vector<T>::realloc(size_type capacity_new)
 	 * XXX: future optimization: we don't have to snapshot data
 	 * which we will not overwrite
 	 */
-	snapshot_data(0, _size);
+	add_data_to_tx(0, _size);
 
 	auto old_data = _data;
 	auto old_size = _size;
@@ -2392,7 +2399,8 @@ vector<T>::realloc(size_type capacity_new)
 
 	alloc(capacity_new);
 
-	construct_range(0, old_begin, old_end);
+	construct_at_end(std::make_move_iterator(old_begin),
+			 std::make_move_iterator(old_end));
 
 	/* destroy and free old data */
 	for (size_type i = 0; i < old_size; ++i)
@@ -2440,7 +2448,7 @@ vector<T>::shrink(size_type size_new)
 	assert(pmemobj_tx_stage() == TX_STAGE_WORK);
 	assert(size_new <= _size);
 
-	snapshot_data(size_new, _size);
+	add_data_to_tx(size_new, _size - size_new);
 
 	for (size_type i = size_new; i < _size; ++i)
 		detail::destroy<value_type>(
@@ -2450,19 +2458,38 @@ vector<T>::shrink(size_type size_new)
 
 /**
  * Private helper function. Takes a “snapshot” of data in range
- * [&_data[idx_first], &_data[idx_last])
+ * [&_data[idx_first], &_data[idx_first + num])
  *
  * @param[in] idx_first first index.
- * @param[in] idx_last last index.
+ * @param[in] num number of elements to snapshot.
  *
  * @throw pmem::transaction_error when snapshotting failed.
  */
 template <typename T>
 void
-vector<T>::snapshot_data(size_type idx_first, size_type idx_last)
+vector<T>::add_data_to_tx(size_type idx_first, size_type num)
 {
+	assert(idx_first + num <= capacity());
+
+#if LIBPMEMOBJ_CPP_VG_MEMCHECK_ENABLED
+	/* Make sure that only data allocated by this vector is accessed */
+	assert(VALGRIND_CHECK_MEM_IS_ADDRESSABLE(_data.get() + idx_first,
+						 num * sizeof(T)) == 0);
+#endif
+
+	auto initialized_num = size() - idx_first;
+
+	/* Snapshot elements in range [idx_first,size()) */
 	detail::conditional_add_to_tx(_data.get() + idx_first,
-				      idx_last - idx_first);
+				      (std::min)(initialized_num, num),
+				      POBJ_XADD_ASSUME_INITIALIZED);
+
+	if (num > initialized_num) {
+		/* Elements after size() do not have to be snapshotted */
+		detail::conditional_add_to_tx(_data.get() + size(),
+					      num - initialized_num,
+					      POBJ_XADD_NO_SNAPSHOT);
+	}
 }
 
 /**
@@ -2471,8 +2498,8 @@ vector<T>::snapshot_data(size_type idx_first, size_type idx_last)
  * Checks if containers have the same number of elements and each element in lhs
  * is equal to element in rhs at the same position.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of the containers are equal, false otherwise
  */
@@ -2490,8 +2517,8 @@ operator==(const vector<T> &lhs, const vector<T> &rhs)
  * Checks if containers have the same number of elements and each element in lhs
  * is equal to element in rhs at the same position.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of the containers are not equal, false otherwise
  */
@@ -2506,8 +2533,8 @@ operator!=(const vector<T> &lhs, const vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically less than contents of
  * rhs, false otherwise
@@ -2524,8 +2551,8 @@ operator<(const vector<T> &lhs, const vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically lesser than or equal to
  * contents of rhs, false otherwise
@@ -2541,8 +2568,8 @@ operator<=(const vector<T> &lhs, const vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically greater than contents
  * of rhs, false otherwise
@@ -2559,8 +2586,8 @@ operator>(const vector<T> &lhs, const vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically greater than or equal
  * to contents of rhs, false otherwise
@@ -2578,7 +2605,7 @@ operator>=(const vector<T> &lhs, const vector<T> &rhs)
  * Checks if containers have the same number of elements and each element in lhs
  * is equal to element in rhs at the same position.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
  * @param[in] rhs second vector of type std::vector<T>
  *
  * @return true if contents of the containers are equal, false otherwise
@@ -2597,7 +2624,7 @@ operator==(const vector<T> &lhs, const std::vector<T> &rhs)
  * Checks if containers have the same number of elements and each element in lhs
  * is equal to element in rhs at the same position.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
  * @param[in] rhs second vector of type std::vector<T>
  *
  * @return true if contents of the containers are not equal, false otherwise
@@ -2613,7 +2640,7 @@ operator!=(const vector<T> &lhs, const std::vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
  * @param[in] rhs second vector of type std::vector<T>
  *
  * @return true if contents of lhs are lexicographically less than contents of
@@ -2631,7 +2658,7 @@ operator<(const vector<T> &lhs, const std::vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
  * @param[in] rhs second vector of ype std::vector<T>
  *
  * @return true if contents of lhs are lexicographically lesser than or equal to
@@ -2649,7 +2676,7 @@ operator<=(const vector<T> &lhs, const std::vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
  * @param[in] rhs second vector of type std::vector<T>
  *
  * @return true if contents of lhs are lexicographically greater than contents
@@ -2667,7 +2694,7 @@ operator>(const vector<T> &lhs, const std::vector<T> &rhs)
  * Comparison operator. Compares the contents of two containers
  * lexicographically.
  *
- * @param[in] lhs first vector of type pmem::obj::experimental::vector<T>
+ * @param[in] lhs first vector of type pmem::obj::vector<T>
  * @param[in] rhs second vector of type std::vector<T>
  *
  * @return true if contents of lhs are lexicographically greater than or equal
@@ -2687,7 +2714,7 @@ operator>=(const vector<T> &lhs, const std::vector<T> &rhs)
  * is equal to element in rhs at the same position.
  *
  * @param[in] lhs first vector of type std::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of the containers are equal, false otherwise
  */
@@ -2705,7 +2732,7 @@ operator==(const std::vector<T> &lhs, const vector<T> &rhs)
  * is equal to element in rhs at the same position.
  *
  * @param[in] lhs first vector of type std::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of the containers are not equal, false otherwise
  */
@@ -2721,7 +2748,7 @@ operator!=(const std::vector<T> &lhs, const vector<T> &rhs)
  * lexicographically.
  *
  * @param[in] lhs first vector of type std::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically less than contents of
  * rhs, false otherwise
@@ -2738,7 +2765,7 @@ operator<(const std::vector<T> &lhs, const vector<T> &rhs)
  * lexicographically.
  *
  * @param[in] lhs first vector of ype std::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically lesser than or equal to
  * contents of rhs, false otherwise
@@ -2755,7 +2782,7 @@ operator<=(const std::vector<T> &lhs, const vector<T> &rhs)
  * lexicographically.
  *
  * @param[in] lhs first vector of type std::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically greater than contents
  * of rhs, false otherwise
@@ -2773,7 +2800,7 @@ operator>(const std::vector<T> &lhs, const vector<T> &rhs)
  * lexicographically.
  *
  * @param[in] lhs first vector of type std::vector<T>
- * @param[in] rhs second vector of type pmem::obj::experimental::vector<T>
+ * @param[in] rhs second vector of type pmem::obj::vector<T>
  *
  * @return true if contents of lhs are lexicographically greater than or equal
  * to contents of rhs, false otherwise
@@ -2797,8 +2824,6 @@ swap(vector<T> &lhs, vector<T> &rhs)
 {
 	lhs.swap(rhs);
 }
-
-} /* namespace experimental */
 
 } /* namespace obj */
 

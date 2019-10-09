@@ -33,7 +33,7 @@ cmake_minimum_required(VERSION 3.3)
 project(libpmemobj-cpp C CXX)
 
 set(VERSION_MAJOR 1)
-set(VERSION_MINOR 7)
+set(VERSION_MINOR 8)
 set(VERSION_PATCH 0)
 #set(VERSION_PRERELEASE rc1)
 
@@ -45,7 +45,7 @@ if (VERSION_PRERELEASE)
 	set(VERSION ${VERSION}-${VERSION_PRERELEASE})
 endif()
 
-set(LIBPMEMOBJ_REQUIRED_VERSION 1.4)
+set(LIBPMEMOBJ_REQUIRED_VERSION 1.7)
 
 set(CMAKE_DISABLE_IN_SOURCE_BUILD ON)
 
@@ -74,10 +74,15 @@ option(USE_ASAN "enable AddressSanitizer (debugging)" OFF)
 option(USE_UBSAN "enable UndefinedBehaviorSanitizer (debugging)" OFF)
 option(TESTS_USE_FORCED_PMEM "run tests with PMEM_IS_PMEM_FORCE=1" OFF)
 option(TESTS_USE_VALGRIND "enable tests with valgrind (if found)" ON)
-option(ENABLE_ARRAY "enable installation and testing of pmem::obj::experimental::array" ON)
-option(ENABLE_VECTOR "enable installation and testing of pmem::obj::experimental::vector" ON)
-option(ENABLE_STRING "enable installation and testing of pmem::obj::experimental::string (depends on ENABLE_VECTOR)" ON)
-option(ENABLE_CONCURRENT_HASHMAP "enable installation and testing of pmem::obj::experimental::concurrent_hash_map (depends on ENABLE_STRING)" ON)
+option(ENABLE_ARRAY "enable installation and testing of pmem::obj::array" ON)
+option(ENABLE_VECTOR "enable installation and testing of pmem::obj::vector" ON)
+option(ENABLE_STRING "enable installation and testing of pmem::obj::string (depends on ENABLE_VECTOR)" ON)
+option(ENABLE_CONCURRENT_HASHMAP "enable installation and testing of pmem::obj::concurrent_hash_map (depends on ENABLE_STRING)" ON)
+option(ENABLE_SEGMENT_VECTOR "enable installation of pmem::obj::experimental::segment_vector" ON)
+option(ENABLE_SEGMENT_VECTOR_ARRAY_EXPSIZE "enable testing of pmem::obj::experimental::segment_vector with array as segment_vector_type and exponential_size_policy" ON)
+option(ENABLE_SEGMENT_VECTOR_VECTOR_EXPSIZE "enable testing of pmem::obj::experimental::segment_vector with vector as segment_vector_type and exponential_size_policy" OFF)
+option(ENABLE_SEGMENT_VECTOR_ARRAY_FIXEDSIZE "enable testing of pmem::obj::experimental::segment_vector with array as segment_vector_type and fixed_size_policy" OFF)
+option(ENABLE_SEGMENT_VECTOR_VECTOR_FIXEDSIZE "enable testing of pmem::obj::experimental::segment_vector with vector as segment_vector_type and fixed_size_policy" ON)
 
 # Required for MSVC to correctly define __cplusplus
 add_flag("/Zc:__cplusplus")
@@ -123,9 +128,9 @@ endif()
 
 if(BUILD_TESTS OR BUILD_EXAMPLES)
 	if(PKG_CONFIG_FOUND)
-		pkg_check_modules(LIBPMEMOBJ REQUIRED libpmemobj>=1.4)
+		pkg_check_modules(LIBPMEMOBJ REQUIRED libpmemobj>=${LIBPMEMOBJ_REQUIRED_VERSION})
 	else()
-		find_package(LIBPMEMOBJ REQUIRED 1.4)
+		find_package(LIBPMEMOBJ REQUIRED ${LIBPMEMOBJ_REQUIRED_VERSION})
 	endif()
 
 	if (LIBPMEMOBJ_VERSION)
@@ -203,9 +208,13 @@ if(DEVELOPER_MODE)
 endif(DEVELOPER_MODE)
 
 add_cppstyle(include ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/*.hpp)
+add_cppstyle(include-container ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/container/*.hpp)
+add_cppstyle(include-container-detail ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/container/detail/*.hpp)
 add_cppstyle(include-detail ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/detail/*.hpp)
 add_cppstyle(include-experimental ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/experimental/*.hpp)
 add_check_whitespace(include ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/*.hpp)
+add_check_whitespace(include-container ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/container/*.hpp)
+add_check_whitespace(include-container-detail ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/container/detail/*.hpp)
 add_check_whitespace(include-detail ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/detail/*.hpp)
 add_check_whitespace(include-experimental ${CMAKE_CURRENT_SOURCE_DIR}/include/libpmemobj++/experimental/*.hpp)
 add_check_whitespace(cmake-main ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt)
@@ -236,7 +245,8 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 	PATTERN "basic_string.hpp" EXCLUDE
 	PATTERN "contiguous_iterator.hpp" EXCLUDE
 	PATTERN "slice.hpp" EXCLUDE
-	PATTERN "concurrent_hash_map.hpp" EXCLUDE)
+	PATTERN "concurrent_hash_map.hpp" EXCLUDE
+	PATTERN "segment_vector.hpp" EXCLUDE)
 
 if (ENABLE_ARRAY)
 	install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "array.hpp")
@@ -260,6 +270,10 @@ if (ENABLE_ARRAY OR ENABLE_VECTOR OR ENABLE_STRING)
 	install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "slice.hpp")
 endif()
 
+if (ENABLE_SEGMENT_VECTOR)
+	install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "segment_vector.hpp")
+endif()
+
 install(DIRECTORY examples/ DESTINATION ${CMAKE_INSTALL_DOCDIR}/examples
 	FILES_MATCHING PATTERN "*.*pp")
 
@@ -267,7 +281,6 @@ configure_file(${CMAKE_SOURCE_DIR}/cmake/libpmemobj++.pc.in
 		${CMAKE_CURRENT_BINARY_DIR}/libpmemobj++.pc @ONLY)
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libpmemobj++.pc
-	CONFIGURATIONS Release Debug
 	DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 configure_file(

@@ -38,23 +38,18 @@
 #ifndef PMEMOBJ_CONCURRENT_HASH_MAP_HPP
 #define PMEMOBJ_CONCURRENT_HASH_MAP_HPP
 
+#include <libpmemobj++/detail/atomic_backoff.hpp>
 #include <libpmemobj++/detail/common.hpp>
 #include <libpmemobj++/detail/template_helpers.hpp>
-#include <libpmemobj++/experimental/v.hpp>
+
 #include <libpmemobj++/make_persistent.hpp>
-#include <libpmemobj++/make_persistent_atomic.hpp>
 #include <libpmemobj++/mutex.hpp>
 #include <libpmemobj++/p.hpp>
 #include <libpmemobj++/persistent_ptr.hpp>
 #include <libpmemobj++/transaction.hpp>
 
-#if LIBPMEMOBJ_CPP_USE_TBB_RW_MUTEX
-#include "tbb/spin_rw_mutex.h"
-#else
-#include <libpmemobj++/shared_mutex.hpp>
-#endif
-
 #include <libpmemobj++/detail/persistent_pool_ptr.hpp>
+#include <libpmemobj++/shared_mutex.hpp>
 
 #include <atomic>
 #include <cassert>
@@ -65,11 +60,7 @@
 #include <mutex>
 #include <thread>
 #include <type_traits>
-
-#if _MSC_VER
-#include <intrin.h>
-#include <windows.h>
-#endif
+#include <utility>
 
 namespace std
 {
@@ -90,232 +81,12 @@ namespace pmem
 {
 namespace obj
 {
-namespace experimental
+
+namespace concurrent_hash_map_internal
 {
-
-using namespace pmem::obj;
-
-template <typename Key, typename T, typename Hash = std::hash<Key>,
-	  typename KeyEqual = std::equal_to<Key>>
-class concurrent_hash_map;
-
-/** @cond INTERNAL */
-namespace internal
-{
-template <typename Hash>
-using transparent_key_equal = typename Hash::transparent_key_equal;
-
-template <typename Hash>
-using has_transparent_key_equal = detail::supports<Hash, transparent_key_equal>;
-
-template <typename Hash, typename Pred,
-	  bool = has_transparent_key_equal<Hash>::value>
-struct key_equal_type {
-	using type = typename Hash::transparent_key_equal;
-};
-
-template <typename Hash, typename Pred>
-struct key_equal_type<Hash, Pred, false> {
-	using type = Pred;
-};
-
-template <typename Mutex>
-void
-assert_not_locked(Mutex &mtx)
-{
-#ifndef NDEBUG
-	assert(mtx.try_lock());
-	mtx.unlock();
-#else
-	(void)mtx;
-#endif
-}
-
-template <typename Mutex>
-void
-assert_not_locked(pmem::obj::experimental::v<Mutex> &mtx)
-{
-	assert_not_locked<Mutex>(mtx.get());
-}
-
-#if _MSC_VER
-static inline int
-Log2(uint64_t x)
-{
-	unsigned long j;
-	_BitScanReverse64(&j, x);
-	return static_cast<int>(j);
-}
-#elif __GNUC__ || __clang__
-static inline int
-Log2(uint64_t x)
-{
-	// __builtin_clz builtin count _number_ of leading zeroes
-	return 8 * int(sizeof(x)) - __builtin_clzll(x) - 1;
-}
-#else
-static inline int
-Log2(uint64_t x)
-{
-	x |= (x >> 1);
-	x |= (x >> 2);
-	x |= (x >> 4);
-	x |= (x >> 8);
-	x |= (x >> 16);
-	x |= (x >> 32);
-
-	static const int table[64] = {
-		0,  58, 1,  59, 47, 53, 2,  60, 39, 48, 27, 54, 33, 42, 3,  61,
-		51, 37, 40, 49, 18, 28, 20, 55, 30, 34, 11, 43, 14, 22, 4,  62,
-		57, 46, 52, 38, 26, 32, 41, 50, 36, 17, 19, 29, 10, 13, 21, 56,
-		45, 25, 31, 35, 16, 9,  12, 44, 24, 15, 8,  23, 7,  6,  5,  63};
-
-	return table[(x * 0x03f6eaf2cd271461) >> 58];
-}
-#endif
-
-class atomic_backoff {
-	/**
-	 * Time delay, in units of "pause" instructions.
-	 * Should be equal to approximately the number of "pause" instructions
-	 * that take the same time as an context switch. Must be a power of two.
-	 */
-	static const int32_t LOOPS_BEFORE_YIELD = 16;
-	int32_t count;
-
-	static inline void
-	__pause(int32_t delay)
-	{
-		for (; delay > 0; --delay) {
-#if _MSC_VER
-			YieldProcessor();
-#elif __GNUC__ && (__i386__ || __x86_64__)
-			// Only i386 and x86-64 have pause instruction
-			__builtin_ia32_pause();
-#endif
-		}
-	}
-
-public:
-	/**
-	 * Deny copy constructor
-	 */
-	atomic_backoff(const atomic_backoff &) = delete;
-	/**
-	 * Deny assignment
-	 */
-	atomic_backoff &operator=(const atomic_backoff &) = delete;
-
-	/** Default constructor */
-	/* In many cases, an object of this type is initialized eagerly on hot
-	 * path, as in for(atomic_backoff b; ; b.pause()) {...} For this reason,
-	 * the construction cost must be very small! */
-	atomic_backoff() : count(1)
-	{
-	}
-
-	/**
-	 * This constructor pauses immediately; do not use on hot paths!
-	 */
-	atomic_backoff(bool) : count(1)
-	{
-		pause();
-	}
-
-	/**
-	 * Pause for a while.
-	 */
-	void
-	pause()
-	{
-		if (count <= LOOPS_BEFORE_YIELD) {
-			__pause(count);
-			/* Pause twice as long the next time. */
-			count *= 2;
-		} else {
-			/* Pause is so long that we might as well yield CPU to
-			 * scheduler. */
-			std::this_thread::yield();
-		}
-	}
-
-	/**
-	 * Pause for a few times and return false if saturated.
-	 */
-	bool
-	bounded_pause()
-	{
-		__pause(count);
-		if (count < LOOPS_BEFORE_YIELD) {
-			/* Pause twice as long the next time. */
-			count *= 2;
-			return true;
-		} else {
-			return false;
-		}
-	}
-
-	void
-	reset()
-	{
-		count = 1;
-	}
-}; /* class atomic_backoff */
-
-/**
- * This wrapper for std::atomic<T> allows to initialize volatile atomic fields
- * with custom initializer
- */
-template <typename T, typename InitFunctor>
-class atomic_wrapper {
-public:
-	using value_type = T;
-	using atomic_type = std::atomic<value_type>;
-	using init_type = InitFunctor;
-
-	atomic_wrapper() noexcept
-	{
-	}
-
-	atomic_wrapper(const value_type &val) noexcept : my_atomic(val)
-	{
-	}
-
-	template <typename... Args>
-	atomic_wrapper(Args &&... args)
-	    : my_atomic(init_type()(std::forward<Args>(args)...))
-	{
-	}
-
-	operator atomic_type &() noexcept
-	{
-		return my_atomic;
-	}
-
-private:
-	atomic_type my_atomic;
-};
-
-/**
- * Wrapper around PMDK allocator
- * @throw std::bad_alloc on allocation failure.
- */
-template <typename T, typename U, typename... Args>
-void
-make_persistent_object(pool_base &pop, persistent_ptr<U> &ptr, Args &&... args)
-{
-#if LIBPMEMOBJ_CPP_CONCURRENT_HASH_MAP_USE_ATOMIC_ALLOCATOR
-	make_persistent_atomic<T>(pop, ptr, std::forward<Args>(args)...);
-#else
-	transaction::manual tx(pop);
-	ptr = make_persistent<T>(std::forward<Args>(args)...);
-	transaction::commit();
-#endif
-}
-
-#if !LIBPMEMOBJ_CPP_USE_TBB_RW_MUTEX
+template <typename SharedMutexT>
 class shared_mutex_scoped_lock {
-	using rw_mutex_type = pmem::obj::shared_mutex;
+	using rw_mutex_type = SharedMutexT;
 
 public:
 	shared_mutex_scoped_lock(const shared_mutex_scoped_lock &) = delete;
@@ -354,24 +125,6 @@ public:
 	}
 
 	/**
-	 * Upgrade reader to become a writer.
-	 * This method is added for compatibility with tbb::spin_rw_mutex which
-	 * supports upgrade operation.
-	 *
-	 * @returns Always return false because persistent shared mutex cannot
-	 * be upgraded without releasing and re-acquiring the lock
-	 */
-	bool
-	upgrade_to_writer()
-	{
-		assert(!is_writer);
-		mutex->unlock_shared();
-		is_writer = true;
-		mutex->lock();
-		return false;
-	}
-
-	/**
 	 * Release lock.
 	 */
 	void
@@ -385,19 +138,6 @@ public:
 		} else {
 			m->unlock_shared();
 		}
-	}
-
-	/**
-	 * Downgrade writer to become a reader.
-	 * This method is added for compatibility with tbb::spin_rw_mutex which
-	 * supports downgrade operation.
-	 * @returns false.
-	 */
-	bool
-	downgrade_to_reader()
-	{
-		assert(is_writer);
-		return false;
 	}
 
 	/**
@@ -428,54 +168,202 @@ protected:
 	 */
 	bool is_writer;
 }; /* class shared_mutex_scoped_lock */
-#endif
 
-struct hash_map_node_base {
-#if LIBPMEMOBJ_CPP_USE_TBB_RW_MUTEX
-	/** Mutex type. */
-	using mutex_t = pmem::obj::experimental::v<tbb::spin_rw_mutex>;
+template <typename ScopedLockType>
+using scoped_lock_upgrade_to_writer =
+	decltype(std::declval<ScopedLockType>().upgrade_to_writer());
 
-	/** Scoped lock type for mutex. */
-	using scoped_t = tbb::spin_rw_mutex::scoped_lock;
+template <typename ScopedLockType>
+using scoped_lock_has_upgrade_to_writer =
+	detail::supports<ScopedLockType, scoped_lock_upgrade_to_writer>;
+
+template <typename ScopedLockType>
+using scoped_lock_downgrade_to_reader =
+	decltype(std::declval<ScopedLockType>().downgrade_to_reader());
+
+template <typename ScopedLockType>
+using scoped_lock_has_downgrade_to_reader =
+	detail::supports<ScopedLockType, scoped_lock_downgrade_to_reader>;
+
+template <typename ScopedLockType,
+	  bool = scoped_lock_has_upgrade_to_writer<ScopedLockType>::value
+		  &&scoped_lock_has_downgrade_to_reader<ScopedLockType>::value>
+class scoped_lock_traits {
+public:
+	using scope_lock_type = ScopedLockType;
+
+	static bool
+	initial_rw_state(bool write)
+	{
+		/* For upgradeable locks, initial state is always read */
+		return false;
+	}
+
+	static bool
+	upgrade_to_writer(scope_lock_type &lock)
+	{
+		return lock.upgrade_to_writer();
+	}
+
+	static bool
+	downgrade_to_reader(scope_lock_type &lock)
+	{
+		return lock.downgrade_to_reader();
+	}
+};
+
+template <typename ScopedLockType>
+class scoped_lock_traits<ScopedLockType, false> {
+public:
+	using scope_lock_type = ScopedLockType;
+
+	static bool
+	initial_rw_state(bool write)
+	{
+		/* For non-upgradeable locks, we take lock in required mode
+		 * immediately */
+		return write;
+	}
+
+	static bool
+	upgrade_to_writer(scope_lock_type &lock)
+	{
+		/* This overload is for locks which do not support upgrade
+		 * operation. For those locks, upgrade_to_writer should not be
+		 * called when holding a read lock */
+		return true;
+	}
+
+	static bool
+	downgrade_to_reader(scope_lock_type &lock)
+	{
+		/* This overload is for locks which do not support downgrade
+		 * operation. For those locks, downgrade_to_reader should never
+		 * be called */
+		assert(false);
+
+		return false;
+	}
+};
+}
+
+template <typename Key, typename T, typename Hash = std::hash<Key>,
+	  typename KeyEqual = std::equal_to<Key>,
+	  typename MutexType = pmem::obj::shared_mutex,
+	  typename ScopedLockType = concurrent_hash_map_internal::
+		  shared_mutex_scoped_lock<MutexType>>
+class concurrent_hash_map;
+
+/** @cond INTERNAL */
+namespace concurrent_hash_map_internal
+{
+/* Helper method which throws an exception when called in a tx */
+static inline void
+check_outside_tx()
+{
+	if (pmemobj_tx_stage() != TX_STAGE_NONE)
+		throw pmem::transaction_scope_error(
+			"Function called inside transaction scope.");
+}
+
+template <typename Hash>
+using transparent_key_equal = typename Hash::transparent_key_equal;
+
+template <typename Hash>
+using has_transparent_key_equal = detail::supports<Hash, transparent_key_equal>;
+
+template <typename Hash, typename Pred,
+	  bool = has_transparent_key_equal<Hash>::value>
+struct key_equal_type {
+	using type = typename Hash::transparent_key_equal;
+};
+
+template <typename Hash, typename Pred>
+struct key_equal_type<Hash, Pred, false> {
+	using type = Pred;
+};
+
+template <typename Mutex, typename ScopedLockType>
+void
+assert_not_locked(Mutex &mtx)
+{
+#ifndef NDEBUG
+	ScopedLockType scoped_lock;
+	assert(scoped_lock.try_acquire(mtx));
+	scoped_lock.release();
 #else
-	/** Mutex type. */
-	using mutex_t = pmem::obj::shared_mutex;
+	(void)mtx;
+#endif
+}
+
+template <typename Key, typename T, typename MutexType, typename ScopedLockType>
+struct hash_map_node {
+	/**Mutex type. */
+	using mutex_t = MutexType;
 
 	/** Scoped lock type for mutex. */
-	using scoped_t = shared_mutex_scoped_lock;
-#endif
+	using scoped_t = ScopedLockType;
+
+	using value_type = std::pair<const Key, T>;
 
 	/** Persistent pointer type for next. */
-	using node_base_ptr_t = detail::persistent_pool_ptr<hash_map_node_base>;
+	using node_ptr_t = detail::persistent_pool_ptr<
+		hash_map_node<Key, T, mutex_t, scoped_t>>;
 
 	/** Next node in chain. */
-	node_base_ptr_t next;
+	node_ptr_t next;
 
 	/** Node mutex. */
 	mutex_t mutex;
 
-	hash_map_node_base() : next(OID_NULL)
+	/** Item stored in node */
+	value_type item;
+
+	hash_map_node() : next(OID_NULL)
 	{
 	}
 
-	hash_map_node_base(const node_base_ptr_t &_next) : next(_next)
+	hash_map_node(const node_ptr_t &_next) : next(_next)
 	{
 	}
 
-	hash_map_node_base(node_base_ptr_t &&_next) : next(std::move(_next))
+	hash_map_node(node_ptr_t &&_next) : next(std::move(_next))
+	{
+	}
+
+	hash_map_node(const node_ptr_t &_next, const Key &key)
+	    : next(_next), item(key, T())
+	{
+	}
+
+	hash_map_node(const node_ptr_t &_next, const Key &key, const T &t)
+	    : next(_next), item(key, t)
+	{
+	}
+
+	hash_map_node(const node_ptr_t &_next, value_type &&i)
+	    : next(_next), item(std::move(i))
+	{
+	}
+
+	template <typename... Args>
+	hash_map_node(node_ptr_t &&_next, Args &&... args)
+	    : next(std::forward<node_ptr_t>(_next)),
+	      item(std::forward<Args>(args)...)
+	{
+	}
+
+	hash_map_node(const node_ptr_t &_next, const value_type &i)
+	    : next(_next), item(i)
 	{
 	}
 
 	/** Copy constructor is deleted */
-	hash_map_node_base(const hash_map_node_base &) = delete;
+	hash_map_node(const hash_map_node &) = delete;
 
 	/** Assignment operator is deleted */
-	hash_map_node_base &operator=(const hash_map_node_base &) = delete;
-}; /* struct hash_map_node_base */
-
-/** Empty bucket flag. */
-static detail::persistent_pool_ptr<hash_map_node_base> const empty_bucket =
-	OID_NULL;
+	hash_map_node &operator=(const hash_map_node &) = delete;
+}; /* struct node */
 
 /**
  * The class provides the way to access certain properties of segments
@@ -558,7 +446,7 @@ public:
 	static segment_index_t
 	segment_index_of(size_type index)
 	{
-		return segment_index_t(Log2(index | 1));
+		return segment_index_t(detail::Log2(index | 1));
 	}
 
 	/** @return the first array index of given segment. */
@@ -874,13 +762,6 @@ private:
 	enable_big_segment(pool_base &pop)
 	{
 		block_range blocks = segment_blocks(my_seg);
-#if LIBPMEMOBJ_CPP_CONCURRENT_HASH_MAP_USE_ATOMIC_ALLOCATOR
-		for (segment_index_t b = blocks.first; b < blocks.second; ++b) {
-			if ((*my_table)[b] == nullptr)
-				make_persistent_atomic<bucket_type[]>(
-					pop, (*my_table)[b], block_size(b));
-		}
-#else
 		{
 			transaction::manual tx(pop);
 
@@ -893,7 +774,6 @@ private:
 
 			transaction::commit();
 		}
-#endif
 	}
 
 	/** Pointer to the table of blocks */
@@ -906,54 +786,43 @@ private:
 /**
  * Base class of concurrent_hash_map.
  * Implements logic not dependant to Key/Value types.
+ * MutexType - type of mutex used by buckets.
+ * ScopedLockType - type of scoped lock for mutex.
  */
+template <typename Key, typename T, typename MutexType, typename ScopedLockType>
 class hash_map_base {
 public:
+	using mutex_t = MutexType;
+	using scoped_t = ScopedLockType;
+
 	/** Size type. */
 	using size_type = size_t;
 
 	/** Type of a hash code. */
-	using hashcode_t = size_t;
+	using hashcode_type = size_t;
 
 	/** Node base type. */
-	using node_base = hash_map_node_base;
+	using node = hash_map_node<Key, T, mutex_t, scoped_t>;
 
 	/** Node base pointer. */
-	using node_base_ptr_t = detail::persistent_pool_ptr<node_base>;
-
-	/** tmp node pointer. */
-	using tmp_node_ptr_t = persistent_ptr<node_base>;
+	using node_ptr_t = detail::persistent_pool_ptr<node>;
 
 	/** Bucket type. */
 	struct bucket {
-#if LIBPMEMOBJ_CPP_USE_TBB_RW_MUTEX
-		/** Mutex type for buckets. */
-		using mutex_t = pmem::obj::experimental::v<tbb::spin_rw_mutex>;
-
-		/** Scoped lock type for mutex. */
-		using scoped_t = tbb::spin_rw_mutex::scoped_lock;
-#else
-		/** Mutex type. */
-		using mutex_t = pmem::obj::shared_mutex;
-
-		/** Scoped lock type for mutex. */
-		using scoped_t = shared_mutex_scoped_lock;
-#endif
+		using mutex_t = MutexType;
+		using scoped_t = ScopedLockType;
 
 		/** Bucket mutex. */
 		mutex_t mutex;
 
 		/** Atomic flag to indicate if bucket rehashed */
-		p<std::atomic<bool>> rehashed;
+		p<std::atomic<uint64_t>> rehashed;
 
 		/** List of the nodes stored in the bucket. */
-		node_base_ptr_t node_list;
-
-		/** Pointer used to allocate new node. */
-		tmp_node_ptr_t tmp_node;
+		node_ptr_t node_list;
 
 		/** Default constructor */
-		bucket() : node_list(empty_bucket), tmp_node(nullptr)
+		bucket() : node_list(nullptr)
 		{
 #if LIBPMEMOBJ_CPP_VG_HELGRIND_ENABLED
 			VALGRIND_HG_DISABLE_CHECKING(&rehashed,
@@ -1012,24 +881,38 @@ public:
 	/** Block pointers table type. */
 	using blocks_table_t = segment_ptr_t[block_table_size];
 
-	class calculate_mask {
-	public:
-		hashcode_t
-		operator()(const hash_map_base *map_base) const
-		{
-			return map_base->calculate_mask();
-		}
-	}; /* class mask_initializer */
+	/** Segment mutex type. */
+	using segment_enable_mutex_t = pmem::obj::mutex;
 
-	/** Type of my_mask field */
-	using mask_type = v<atomic_wrapper<hashcode_t, calculate_mask>>;
+	/** Compat and incompat features of a layout */
+	struct features {
+		uint32_t compat;
+		uint32_t incompat;
+	};
+
+	/** Features supported by this header */
+	static constexpr features header_features = {0, 0};
+
+	/* --------------------------------------------------------- */
 
 	/** ID of persistent memory pool where hash map resides. */
 	p<uint64_t> my_pool_uuid;
 
+	/** Specifies features of a hashmap, used to check compatibility between
+	 * header and the data */
+	features layout_features = (features)header_features;
+
+	/** In future, my_mask can be implemented using v<> (8 bytes
+	 * overhead) */
+	std::aligned_storage<sizeof(size_t), sizeof(size_t)>::type
+		my_mask_reserved;
+
 	/** Hash mask = sum of allocated segment sizes - 1. */
 	/* my_mask always restored on restart. */
-	mask_type my_mask;
+	p<std::atomic<hashcode_type>> my_mask;
+
+	/** Padding to the end of cacheline */
+	std::aligned_storage<32, 8>::type padding1;
 
 	/**
 	 * Segment pointers table. Also prevents false sharing between my_mask
@@ -1042,46 +925,30 @@ public:
 	/** Size of container in stored items. */
 	p<std::atomic<size_type>> my_size;
 
-	/** Zero segment. */
-	bucket my_embedded_segment[embedded_buckets];
+	/** Padding to the end of cacheline */
+	std::aligned_storage<24, 8>::type padding2;
 
-	/** Segment mutex type. */
-	using segment_enable_mutex_t = pmem::obj::mutex;
+	/** Reserved for future use */
+	std::aligned_storage<64, 8>::type reserved;
 
 	/** Segment mutex used to enable new segment. */
 	segment_enable_mutex_t my_segment_enable_mutex;
 
-	/** @return true if @arg ptr is valid pointer. */
-	static bool
-	is_valid(void *ptr)
-	{
-		return reinterpret_cast<uintptr_t>(ptr) > uintptr_t(63);
-	}
+	/** Zero segment. */
+	bucket my_embedded_segment[embedded_buckets];
 
-	template <typename U>
-	static bool
-	is_valid(const detail::persistent_pool_ptr<U> &ptr)
-	{
-		return ptr.raw() > uint64_t(63);
-	}
+	/* --------------------------------------------------------- */
 
-	template <typename U>
-	static bool
-	is_valid(const persistent_ptr<U> &ptr)
-	{
-		return ptr.raw().off > uint64_t(63);
-	}
-
-	const std::atomic<hashcode_t> &
+	const std::atomic<hashcode_type> &
 	mask() const noexcept
 	{
-		return const_cast<mask_type &>(my_mask).get(this);
+		return my_mask.get_ro();
 	}
 
-	std::atomic<hashcode_t> &
+	std::atomic<hashcode_type> &
 	mask() noexcept
 	{
-		return my_mask.get(this);
+		return my_mask.get_rw();
 	}
 
 	/** Const segment facade type */
@@ -1121,21 +988,23 @@ public:
 			segment_facade_t seg(my_table, i);
 			mark_rehashed<false>(pop, seg);
 		}
-
-		assert(mask() == embedded_buckets - 1);
 	}
 
 	/**
 	 * Re-calculate mask value on each process restart.
 	 */
-	hashcode_t
-	calculate_mask() const
+	void
+	calculate_mask()
 	{
 #if LIBPMEMOBJ_CPP_VG_HELGRIND_ENABLED
 		VALGRIND_HG_DISABLE_CHECKING(&my_size, sizeof(my_size));
 		VALGRIND_HG_DISABLE_CHECKING(&my_mask, sizeof(my_mask));
 #endif
-		hashcode_t m = embedded_buckets - 1;
+#if LIBPMEMOBJ_CPP_VG_PMEMCHECK_ENABLED
+		VALGRIND_PMC_REMOVE_PMEM_MAPPING(&my_mask, sizeof(my_mask));
+#endif
+
+		hashcode_type m = embedded_buckets - 1;
 
 		const_segment_facade_t segment(
 			my_table, segment_traits_t::embedded_segments);
@@ -1144,7 +1013,8 @@ public:
 			m += segment.size();
 			++segment;
 		}
-		return m;
+
+		mask().store(m, std::memory_order_relaxed);
 	}
 
 	void
@@ -1165,7 +1035,7 @@ public:
 		for (size_type i = 0; i < segment.size(); ++i) {
 			bucket *b = &(segment[i]);
 
-			assert_not_locked(b->mutex);
+			assert_not_locked<mutex_t, scoped_t>(b->mutex);
 
 			b->set_rehashed(std::memory_order_relaxed);
 		}
@@ -1179,20 +1049,6 @@ public:
 
 			pop.drain();
 		}
-	}
-
-	/**
-	 * Add new node pointed by @arg b->tmp_node to bucket @arg b
-	 */
-	void
-	add_to_bucket(bucket *b, pool_base &pop)
-	{
-		assert(b->is_rehashed(std::memory_order_relaxed) == true);
-		assert(is_valid(b->tmp_node));
-		assert(b->tmp_node->next == b->node_list);
-
-		b->node_list = b->tmp_node; /* bucket is locked */
-		pop.persist(&(b->node_list), sizeof(b->node_list));
 	}
 
 	/**
@@ -1247,7 +1103,7 @@ public:
 	 * @return pointer to the bucket.
 	 */
 	bucket *
-	get_bucket(hashcode_t h) const
+	get_bucket(hashcode_type h) const
 	{
 		segment_index_t s = segment_traits_t::segment_index_of(h);
 
@@ -1264,9 +1120,9 @@ public:
 	 * Check for mask race
 	 */
 	inline bool
-	check_mask_race(hashcode_t h, hashcode_t &m) const
+	check_mask_race(hashcode_type h, hashcode_type &m) const
 	{
-		hashcode_t m_now, m_old = m;
+		hashcode_type m_now, m_old = m;
 
 		m_now = mask().load(std::memory_order_acquire);
 
@@ -1280,8 +1136,8 @@ public:
 	 * Process mask race, check for rehashing collision
 	 */
 	bool
-	check_rehashing_collision(hashcode_t h, hashcode_t m_old,
-				  hashcode_t m) const
+	check_rehashing_collision(hashcode_type h, hashcode_type m_old,
+				  hashcode_type m) const
 	{
 		assert(m_old != m);
 
@@ -1306,41 +1162,27 @@ public:
 	}
 
 	/**
-	 * Correct bucket state after crash.
-	 */
-	void
-	correct_bucket(bucket *b)
-	{
-		pool_base pop = get_pool_base();
-
-		if (is_valid(b->tmp_node)) {
-			if (b->tmp_node->next == b->node_list) {
-				insert_new_node(pop, b);
-			} else {
-				b->tmp_node.raw_ptr()->off = 0;
-				pop.persist(&(b->tmp_node.raw().off),
-					    sizeof(b->tmp_node.raw().off));
-			}
-		}
-	}
-
-	/**
 	 * Insert a node.
 	 * @return new size.
 	 */
+
+	template <typename Node, typename... Args>
 	size_type
-	insert_new_node(pool_base &pop, bucket *b)
+	insert_new_node(bucket *b, detail::persistent_pool_ptr<Node> &new_node,
+			Args &&... args)
 	{
-		add_to_bucket(b, pop);
+		pool_base pop = get_pool_base();
+
+		pmem::obj::transaction::run(pop, [&] {
+			new_node = pmem::obj::make_persistent<Node>(
+				b->node_list, std::forward<Args>(args)...);
+			b->node_list = new_node; /* bucket is locked */
+		});
 
 		/* prefix form is to enforce allocation after the first item
 		 * inserted */
 		size_t sz = ++(my_size.get_rw());
 		pop.persist(&my_size, sizeof(my_size));
-
-		b->tmp_node.raw_ptr()->off = 0;
-		pop.persist(&(b->tmp_node.raw().off),
-			    sizeof(b->tmp_node.raw().off));
 
 		return sz;
 	}
@@ -1350,11 +1192,13 @@ public:
 	 * @return true if new segment was allocated and false otherwise
 	 */
 	bool
-	check_growth(hashcode_t m, size_type sz)
+	check_growth(hashcode_type m, size_type sz)
 	{
 		if (sz >= m) {
-			segment_index_t new_seg = static_cast<segment_index_t>(
-				Log2(m + 1)); /* optimized segment_index_of */
+			segment_index_t new_seg =
+				static_cast<segment_index_t>(detail::Log2(
+					m +
+					1)); /* optimized segment_index_of */
 
 			assert(segment_facade_t(my_table, new_seg - 1)
 				       .is_valid());
@@ -1398,10 +1242,10 @@ public:
 
 	/**
 	 * Swap hash_map_base
-	 * @throws std::runtime_error in case of PMDK transaction failed
+	 * @throws std::transaction_error in case of PMDK transaction failed
 	 */
 	void
-	internal_swap(hash_map_base &table)
+	internal_swap(hash_map_base<Key, T, mutex_t, scoped_t> &table)
 	{
 		pool_base p = get_pool_base();
 		{
@@ -1481,8 +1325,9 @@ public:
 
 #if !defined(_MSC_VER) || defined(__INTEL_COMPILER)
 private:
-	template <typename Key, typename T, typename Hash, typename KeyEqual>
-	friend class experimental::concurrent_hash_map;
+	template <typename Key, typename T, typename Hash, typename KeyEqual,
+		  typename MutexType, typename ScopedLockType>
+	friend class ::pmem::obj::concurrent_hash_map;
 #else
 public: /* workaround */
 #endif
@@ -1495,7 +1340,7 @@ public: /* workaround */
 			my_node = static_cast<node *>(
 				my_bucket->node_list.get(my_map->my_pool_uuid));
 
-			if (!hash_map_base::is_valid(my_node)) {
+			if (!my_node) {
 				advance_to_next_bucket();
 			}
 		}
@@ -1503,9 +1348,7 @@ public: /* workaround */
 
 public:
 	/** Construct undefined iterator. */
-	hash_map_iterator() : my_map(), my_index(), my_bucket(), my_node()
-	{
-	}
+	hash_map_iterator() = default;
 
 	/** Copy constructor. */
 	hash_map_iterator(const hash_map_iterator &other)
@@ -1527,10 +1370,12 @@ public:
 	{
 	}
 
+	hash_map_iterator &operator=(const hash_map_iterator &it) = default;
+
 	/** Indirection (dereference). */
 	reference operator*() const
 	{
-		assert(hash_map_base::is_valid(my_node));
+		assert(my_node);
 		return my_node->item;
 	}
 
@@ -1564,23 +1409,22 @@ public:
 
 private:
 	/** Concurrent_hash_map over which we are iterating. */
-	map_ptr my_map;
+	map_ptr my_map = nullptr;
 
 	/** Bucket index for current item. */
-	size_t my_index;
+	size_t my_index = 0;
 
 	/** Pointer to bucket. */
-	bucket *my_bucket;
+	bucket *my_bucket = nullptr;
 
 	/** Pointer to node that has current item. */
-	node *my_node;
+	node *my_node = nullptr;
 
 	class bucket_accessor {
 	public:
 		bucket_accessor(map_ptr m, size_t index)
 		{
 			my_bucket = m->get_bucket(index);
-			const_cast<map_type *>(m)->correct_bucket(my_bucket);
 		}
 
 		bucket *
@@ -1604,7 +1448,7 @@ private:
 			bucket_accessor acc(my_map, k);
 			my_bucket = acc.get();
 
-			if (hash_map_base::is_valid(my_bucket->node_list)) {
+			if (my_bucket->node_list) {
 				my_node = static_cast<node *>(
 					my_bucket->node_list.get(
 						my_map->my_pool_uuid));
@@ -1638,134 +1482,119 @@ operator!=(const hash_map_iterator<Container, M> &i,
 {
 	return i.my_node != j.my_node || i.my_map != j.my_map;
 }
-
-} /* namespace internal */
+} /* namespace concurrent_hash_map_internal */
 /** @endcond */
 
 /**
  * Persistent memory aware implementation of Intel TBB concurrent_hash_map.
+ * The implementation is based on a concurrent hash table algorithm
+ * (https://arxiv.org/ftp/arxiv/papers/1509/1509.02235.pdf) where elements
+ * assigned to buckets based on a hash code are calculated from a key.
+ * In addition to concurrent find, insert, and erase operations, the algorithm
+ * employs resizing and on-demand per-bucket rehashing. The hash table consists
+ * of an array of buckets, and each bucket consists of a list of nodes and a
+ * read-write lock to control concurrent access by multiple threads.
+ *
+ * Each time, the pool with concurrent_hash_map is being opened, the
+ * concurrent_hash_map requires runtime_initialize() to be called (in order to
+ * recalculate mask and restore the size).
+ *
+ * find(), insert(), erase() (and all overloads) are guaranteed to be
+ * thread-safe.
+ *
+ * MutexType defines type of read write lock used in concurrent_hash_map.
+ * ScopedLockType defines a mutex wrapper that provides RAII-style mechanism
+ * for owning a mutex. It should implement following methods and constructors:
+ * ScopedLockType()
+ * ScopedLockType(rw_mutex_type &m, bool write = true)
+ * void acquire(rw_mutex_type &m, bool write)
+ * void release()
+ * bool try_acquire(rw_mutex_type &m, bool write)
+ *
+ * and optionally:
+ * bool upgrade_to_writer()
+ * bool downgrade_to_reader()
+ * bool is_writer (variable)
+ *
+ * Implementing all optional methods and supplying is_writer variable can
+ * improve performance if MutexType supports efficient upgrading and
+ * downgrading operations.
+ *
+ * The typical usage example would be:
+ * @snippet doc_snippets/concurrent_hash_map.cpp concurrent_hash_map_example
  */
-template <typename Key, typename T, typename Hash, typename KeyEqual>
-class concurrent_hash_map : protected internal::hash_map_base {
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
+class concurrent_hash_map
+    : protected concurrent_hash_map_internal::hash_map_base<Key, T, MutexType,
+							    ScopedLockType> {
 	template <typename Container, bool is_const>
-	friend class internal::hash_map_iterator;
+	friend class concurrent_hash_map_internal::hash_map_iterator;
 
 public:
+	using size_type = typename concurrent_hash_map_internal::hash_map_base<
+		Key, T, MutexType, ScopedLockType>::size_type;
+	using hashcode_type =
+		typename concurrent_hash_map_internal::hash_map_base<
+			Key, T, MutexType, ScopedLockType>::hashcode_type;
 	using key_type = Key;
 	using mapped_type = T;
-	using value_type = std::pair<const Key, T>;
-	using size_type = hash_map_base::size_type;
+	using value_type = typename concurrent_hash_map_internal::hash_map_base<
+		Key, T, MutexType, ScopedLockType>::node::value_type;
 	using difference_type = ptrdiff_t;
 	using pointer = value_type *;
 	using const_pointer = const value_type *;
 	using reference = value_type &;
 	using const_reference = const value_type &;
-	using iterator =
-		internal::hash_map_iterator<concurrent_hash_map, false>;
-	using const_iterator =
-		internal::hash_map_iterator<concurrent_hash_map, true>;
+	using iterator = concurrent_hash_map_internal::hash_map_iterator<
+		concurrent_hash_map, false>;
+	using const_iterator = concurrent_hash_map_internal::hash_map_iterator<
+		concurrent_hash_map, true>;
 	using hasher = Hash;
-	using key_equal =
-		typename internal::key_equal_type<Hash, KeyEqual>::type;
+	using key_equal = typename concurrent_hash_map_internal::key_equal_type<
+		Hash, KeyEqual>::type;
 
 protected:
-	friend class const_accessor;
-	struct node;
-
-	/**
-	 * Node structure to store Key/Value pair.
+	using mutex_t = MutexType;
+	using scoped_t = ScopedLockType;
+	/*
+	 * Explicitly use methods and types from template base class
 	 */
-	struct node : public node_base {
-		value_type item;
-		node(const Key &key, const node_base_ptr_t &_next = OID_NULL)
-		    : node_base(_next), item(key, T())
-		{
-		}
+	using hash_map_base =
+		concurrent_hash_map_internal::hash_map_base<Key, T, mutex_t,
+							    scoped_t>;
+	using hash_map_base::calculate_mask;
+	using hash_map_base::check_growth;
+	using hash_map_base::check_mask_race;
+	using hash_map_base::embedded_buckets;
+	using hash_map_base::get_bucket;
+	using hash_map_base::get_pool_base;
+	using hash_map_base::header_features;
+	using hash_map_base::insert_new_node;
+	using hash_map_base::internal_swap;
+	using hash_map_base::layout_features;
+	using hash_map_base::mask;
+	using hash_map_base::reserve;
+	using node = typename hash_map_base::node;
+	using node_mutex_t = typename node::mutex_t;
+	using node_ptr_t = typename hash_map_base::node_ptr_t;
+	using bucket = typename hash_map_base::bucket;
+	using bucket_lock_type = typename bucket::scoped_t;
+	using segment_index_t = typename hash_map_base::segment_index_t;
+	using segment_traits_t = typename hash_map_base::segment_traits_t;
+	using segment_facade_t = typename hash_map_base::segment_facade_t;
+	using scoped_lock_traits_type =
+		concurrent_hash_map_internal::scoped_lock_traits<scoped_t>;
 
-		node(const Key &key, const T &t,
-		     const node_base_ptr_t &_next = OID_NULL)
-		    : node_base(_next), item(key, t)
-		{
-		}
-
-		node(const Key &key, T &&t, node_base_ptr_t &&_next = OID_NULL)
-		    : node_base(std::move(_next)), item(key, std::move(t))
-		{
-		}
-
-		node(value_type &&i, node_base_ptr_t &&_next = OID_NULL)
-		    : node_base(std::move(_next)), item(std::move(i))
-		{
-		}
-
-		node(value_type &&i, const node_base_ptr_t &_next = OID_NULL)
-		    : node_base(_next), item(std::move(i))
-		{
-		}
-
-		template <typename... Args>
-		node(Args &&... args, node_base_ptr_t &&_next = OID_NULL)
-		    : node_base(std::forward<node_base_ptr_t>(_next)),
-		      item(std::forward<Args>(args)...)
-		{
-		}
-
-		node(const value_type &i,
-		     const node_base_ptr_t &_next = OID_NULL)
-		    : node_base(_next), item(i)
-		{
-		}
-	};
-
+	friend class const_accessor;
 	using persistent_node_ptr_t = detail::persistent_pool_ptr<node>;
 
 	void
-	delete_node(const node_base_ptr_t &n)
+	delete_node(const node_ptr_t &n)
 	{
 		delete_persistent<node>(
 			detail::static_persistent_pool_pointer_cast<node>(n)
-				.get_persistent_ptr(my_pool_uuid));
-	}
-
-	static void
-	allocate_node_copy_construct(pool_base &pop,
-				     persistent_ptr<node> &node_ptr,
-				     const void *param,
-				     const node_base_ptr_t &next = OID_NULL)
-	{
-		const value_type *v = static_cast<const value_type *>(param);
-		internal::make_persistent_object<node>(pop, node_ptr, *v, next);
-	}
-
-	static void
-	allocate_node_move_construct(pool_base &pop,
-				     persistent_ptr<node> &node_ptr,
-				     const void *param,
-				     const node_base_ptr_t &next = OID_NULL)
-	{
-		const value_type *v = static_cast<const value_type *>(param);
-		internal::make_persistent_object<node>(
-			pop, node_ptr, std::move(*const_cast<value_type *>(v)),
-			next);
-	}
-
-	static void
-	allocate_node_default_construct(pool_base &pop,
-					persistent_ptr<node> &node_ptr,
-					const void *param,
-					const node_base_ptr_t &next = OID_NULL)
-	{
-		const Key &key = *static_cast<const Key *>(param);
-		internal::make_persistent_object<node>(pop, node_ptr, key,
-						       next);
-	}
-
-	static void
-	do_not_allocate_node(pool_base &, persistent_ptr<node> &node_ptr,
-			     const void *,
-			     const node_base_ptr_t &next = OID_NULL)
-	{
-		assert(false);
+				.get_persistent_ptr(this->my_pool_uuid));
 	}
 
 	template <typename K>
@@ -1773,16 +1602,16 @@ protected:
 	search_bucket(const K &key, bucket *b) const
 	{
 		assert(b->is_rehashed(std::memory_order_relaxed));
-		assert(!is_valid(b->tmp_node));
 
 		persistent_node_ptr_t n =
 			detail::static_persistent_pool_pointer_cast<node>(
 				b->node_list);
 
-		while (is_valid(n) &&
-		       !key_equal{}(key, n.get(my_pool_uuid)->item.first)) {
+		while (n &&
+		       !key_equal{}(key,
+				    n.get(this->my_pool_uuid)->item.first)) {
 			n = detail::static_persistent_pool_pointer_cast<node>(
-				n.get(my_pool_uuid)->next);
+				n.get(this->my_pool_uuid)->next);
 		}
 
 		return n;
@@ -1792,12 +1621,12 @@ protected:
 	 * Bucket accessor is to find, rehash, acquire a lock, and access a
 	 * bucket
 	 */
-	class bucket_accessor : public bucket::scoped_t {
+	class bucket_accessor : public bucket_lock_type {
 		bucket *my_b;
 
 	public:
-		bucket_accessor(concurrent_hash_map *base, const hashcode_t h,
-				bool writer = false)
+		bucket_accessor(concurrent_hash_map *base,
+				const hashcode_type h, bool writer = false)
 		{
 			acquire(base, h, writer);
 		}
@@ -1807,14 +1636,15 @@ protected:
 		 * acquire the lock
 		 */
 		inline void
-		acquire(concurrent_hash_map *base, const hashcode_t h,
+		acquire(concurrent_hash_map *base, const hashcode_type h,
 			bool writer = false)
 		{
 			my_b = base->get_bucket(h);
 
 			if (my_b->is_rehashed(std::memory_order_acquire) ==
 				    false &&
-			    try_acquire(my_b->mutex, /*write=*/true)) {
+			    bucket_lock_type::try_acquire(this->my_b->mutex,
+							  /*write=*/true)) {
 				if (my_b->is_rehashed(
 					    std::memory_order_relaxed) ==
 				    false) {
@@ -1822,16 +1652,7 @@ protected:
 					base->rehash_bucket<false>(my_b, h);
 				}
 			} else {
-				bucket::scoped_t::acquire(my_b->mutex, writer);
-			}
-
-			if (is_valid(my_b->tmp_node)) {
-				/* The condition is true only when insert
-				 * operation was interupted on previous run */
-				if (!this->is_writer())
-					this->upgrade_to_writer();
-				assert(this->is_writer());
-				base->correct_bucket(my_b);
+				bucket_lock_type::acquire(my_b->mutex, writer);
 			}
 
 			assert(my_b->is_rehashed(std::memory_order_relaxed));
@@ -1843,7 +1664,7 @@ protected:
 		bool
 		is_writer() const
 		{
-			return bucket::scoped_t::is_writer;
+			return bucket_lock_type::is_writer;
 		}
 
 		/**
@@ -1874,7 +1695,8 @@ protected:
 
 	public:
 		serial_bucket_accessor(concurrent_hash_map *base,
-				       const hashcode_t h, bool writer = false)
+				       const hashcode_type h,
+				       bool writer = false)
 		{
 			acquire(base, h, writer);
 		}
@@ -1883,7 +1705,7 @@ protected:
 		 * Find a bucket by masked hashcode, optionally rehash
 		 */
 		inline void
-		acquire(concurrent_hash_map *base, const hashcode_t h,
+		acquire(concurrent_hash_map *base, const hashcode_type h,
 			bool writer = false)
 		{
 			my_b = base->get_bucket(h);
@@ -1893,8 +1715,6 @@ protected:
 				/* recursive rehashing */
 				base->rehash_bucket<true>(my_b, h);
 			}
-
-			base->correct_bucket(my_b);
 
 			assert(my_b->is_rehashed(std::memory_order_relaxed));
 		}
@@ -1907,18 +1727,6 @@ protected:
 		 */
 		bool
 		is_writer() const
-		{
-			return true;
-		}
-
-		/**
-		 * This method is added for consistency with bucket_accessor
-		 * class
-		 *
-		 * @return Always returns true
-		 */
-		bool
-		upgrade_to_writer() const
 		{
 			return true;
 		}
@@ -1943,55 +1751,61 @@ protected:
 		}
 	};
 
-	hashcode_t
-	get_hash_code(node_base_ptr_t &n)
+	hashcode_type
+	get_hash_code(node_ptr_t &n)
 	{
 		return hasher{}(
 			detail::static_persistent_pool_pointer_cast<node>(n)(
-				my_pool_uuid)
+				this->my_pool_uuid)
 				->item.first);
 	}
 
 	template <bool serial>
 	void
-	rehash_bucket(bucket *b_new, const hashcode_t h)
+	rehash_bucket(bucket *b_new, const hashcode_type h)
 	{
 		using accessor_type = typename std::conditional<
 			serial, serial_bucket_accessor, bucket_accessor>::type;
+
+		using scoped_lock_traits_type =
+			concurrent_hash_map_internal::scoped_lock_traits<
+				accessor_type>;
 
 		/* First two bucket should be always rehashed */
 		assert(h > 1);
 
 		pool_base pop = get_pool_base();
-		node_base_ptr_t *p_new = &(b_new->node_list);
+		node_ptr_t *p_new = &(b_new->node_list);
 		bool restore_after_crash = *p_new != nullptr;
 
 		/* get parent mask from the topmost bit */
-		hashcode_t mask = (1u << internal::Log2(h)) - 1;
+		hashcode_type mask = (1u << detail::Log2(h)) - 1;
 		assert((h & mask) < h);
-		bool writer = false;
-		accessor_type b_old(this, h & mask, writer);
+		accessor_type b_old(
+			this, h & mask,
+			scoped_lock_traits_type::initial_rw_state(true));
 
 		/* get full mask for new bucket */
 		mask = (mask << 1) | 1;
 		assert((mask & (mask + 1)) == 0 && (h & mask) == h);
 	restart:
-		for (node_base_ptr_t *p_old = &(b_old->node_list), n = *p_old;
-		     is_valid(n); n = *p_old) {
-			hashcode_t c = get_hash_code(n);
+		for (node_ptr_t *p_old = &(b_old->node_list), n = *p_old; n;
+		     n = *p_old) {
+			hashcode_type c = get_hash_code(n);
 #ifndef NDEBUG
-			hashcode_t bmask = h & (mask >> 1);
+			hashcode_type bmask = h & (mask >> 1);
 
 			bmask = bmask == 0
 				? 1 /* minimal mask of parent bucket */
-				: (1u << (internal::Log2(bmask) + 1)) - 1;
+				: (1u << (detail::Log2(bmask) + 1)) - 1;
 
 			assert((c & bmask) == (h & bmask));
 #endif
 
 			if ((c & mask) == h) {
 				if (!b_old.is_writer() &&
-				    !b_old.upgrade_to_writer()) {
+				    !scoped_lock_traits_type::upgrade_to_writer(
+					    b_old)) {
 					goto restart;
 					/* node ptr can be invalid due to
 					 * concurrent erase */
@@ -2002,8 +1816,10 @@ protected:
 					       (mask & get_hash_code(*p_new)) ==
 						       h &&
 					       *p_new != n) {
-						p_new = &((*p_new)(my_pool_uuid)
-								  ->next);
+						p_new = &(
+							(*p_new)(
+								this->my_pool_uuid)
+								->next);
 					}
 
 					restore_after_crash = false;
@@ -2014,20 +1830,20 @@ protected:
 				pop.persist(p_new, sizeof(*p_new));
 
 				/* exclude from b_old */
-				*p_old = n(my_pool_uuid)->next;
+				*p_old = n(this->my_pool_uuid)->next;
 				pop.persist(p_old, sizeof(*p_old));
 
-				p_new = &(n(my_pool_uuid)->next);
+				p_new = &(n(this->my_pool_uuid)->next);
 			} else {
 				/* iterate to next item */
-				p_old = &(n(my_pool_uuid)->next);
+				p_old = &(n(this->my_pool_uuid)->next);
 			}
 		}
 
 		if (restore_after_crash) {
 			while (*p_new != nullptr &&
 			       (mask & get_hash_code(*p_new)) == h)
-				p_new = &((*p_new)(my_pool_uuid)->next);
+				p_new = &((*p_new)(this->my_pool_uuid)->next);
 		}
 
 		*p_new = nullptr;
@@ -2038,25 +1854,13 @@ protected:
 		pop.persist(b_new->rehashed);
 	}
 
-	struct call_clear_on_leave {
-		concurrent_hash_map *my_ch_map;
-		call_clear_on_leave(concurrent_hash_map *a_ch_map)
-		    : my_ch_map(a_ch_map)
-		{
-		}
-
-		void
-		dismiss()
-		{
-			my_ch_map = 0;
-		}
-
-		~call_clear_on_leave()
-		{
-			if (my_ch_map)
-				my_ch_map->clear();
-		}
-	};
+	void
+	check_features()
+	{
+		if (layout_features.incompat != header_features.incompat)
+			throw pmem::layout_error(
+				"Incompat flags mismatch, for more details go to: https://pmem.io/pmdk/cpp_obj/ \n");
+	}
 
 public:
 	class accessor;
@@ -2064,10 +1868,12 @@ public:
 	 * Combines data access, locking, and garbage collection.
 	 */
 	class const_accessor
-	    : private node::scoped_t /*which derived from no_copy*/ {
-		friend class concurrent_hash_map<Key, T, Hash, KeyEqual>;
+	    : protected node::scoped_t /*which derived from no_copy*/ {
+		friend class concurrent_hash_map<Key, T, Hash, KeyEqual,
+						 mutex_t, scoped_t>;
 		friend class accessor;
 		using node_ptr_t = pmem::obj::persistent_ptr<node>;
+		using node::scoped_t::try_acquire;
 
 	public:
 		/**
@@ -2088,10 +1894,15 @@ public:
 
 		/**
 		 * Release accessor.
+		 * Cannot be called inside of a transaction.
+		 *
+		 * @throw transaction_scope_error if called inside tranaction
 		 */
 		void
 		release()
 		{
+			concurrent_hash_map_internal::check_outside_tx();
+
 			if (my_node) {
 				node::scoped_t::release();
 				my_node = 0;
@@ -2118,9 +1929,12 @@ public:
 
 		/**
 		 * Create empty result
+		 *
+		 * Cannot be used in a transaction.
 		 */
 		const_accessor() : my_node(OID_NULL)
 		{
+			concurrent_hash_map_internal::check_outside_tx();
 		}
 
 		/**
@@ -2133,15 +1947,9 @@ public:
 		}
 
 	protected:
-		bool
-		is_writer()
-		{
-			return node::scoped_t::is_writer;
-		}
-
 		node_ptr_t my_node;
 
-		hashcode_t my_hash;
+		hashcode_type my_hash;
 	};
 
 	/**
@@ -2171,25 +1979,29 @@ public:
 	/**
 	 * Construct empty table.
 	 */
-	concurrent_hash_map() : internal::hash_map_base()
+	concurrent_hash_map() : hash_map_base()
 	{
+		runtime_initialize(true);
 	}
 
 	/**
 	 * Construct empty table with n preallocated buckets. This number
 	 * serves also as initial concurrency level.
 	 */
-	concurrent_hash_map(size_type n) : internal::hash_map_base()
+	concurrent_hash_map(size_type n) : hash_map_base()
 	{
+		runtime_initialize(true);
+
 		reserve(n);
 	}
 
 	/**
 	 * Copy constructor
 	 */
-	concurrent_hash_map(const concurrent_hash_map &table)
-	    : internal::hash_map_base()
+	concurrent_hash_map(const concurrent_hash_map &table) : hash_map_base()
 	{
+		runtime_initialize(true);
+
 		reserve(table.size());
 
 		internal_copy(table);
@@ -2198,9 +2010,10 @@ public:
 	/**
 	 * Move constructor
 	 */
-	concurrent_hash_map(concurrent_hash_map &&table)
-	    : internal::hash_map_base()
+	concurrent_hash_map(concurrent_hash_map &&table) : hash_map_base()
 	{
+		runtime_initialize(true);
+
 		swap(table);
 	}
 
@@ -2210,6 +2023,8 @@ public:
 	template <typename I>
 	concurrent_hash_map(I first, I last)
 	{
+		runtime_initialize(true);
+
 		reserve(static_cast<size_type>(std::distance(first, last)));
 
 		internal_copy(first, last);
@@ -2220,6 +2035,8 @@ public:
 	 */
 	concurrent_hash_map(std::initializer_list<value_type> il)
 	{
+		runtime_initialize(true);
+
 		reserve(il.size());
 
 		internal_copy(il.begin(), il.end());
@@ -2227,12 +2044,19 @@ public:
 
 	/**
 	 * Intialize persistent concurrent hash map after process restart.
-	 * Should be called everytime after process restart.
+	 * MUST be called everytime after process restart.
 	 * Not thread safe.
+	 *
+	 * @throw pmem::layout_error if hashmap was created using incompatible
+	 * version of libpmemobj-cpp
 	 */
 	void
-	initialize(bool graceful_shutdown = false)
+	runtime_initialize(bool graceful_shutdown = false)
 	{
+		check_features();
+
+		calculate_mask();
+
 		if (!graceful_shutdown) {
 			auto actual_size =
 				std::distance(this->begin(), this->end());
@@ -2247,8 +2071,14 @@ public:
 
 	/**
 	 * Assignment
-	 * @throws std::runtime_error in case of PMDK transaction failure
 	 * Not thread safe.
+	 *
+	 * @throw std::transaction_error in case of PMDK transaction failure
+	 * @throw pmem::transaction_alloc_error when allocating new memory
+	 * failed.
+	 * @throw pmem::transaction_free_error when freeing old underlying array
+	 * failed.
+	 * @throw rethrows constructor exception.
 	 */
 	concurrent_hash_map &
 	operator=(const concurrent_hash_map &table)
@@ -2263,8 +2093,14 @@ public:
 
 	/**
 	 * Assignment
-	 * @throws std::runtime_error in case of PMDK transaction failure
 	 * Not thread safe.
+	 *
+	 * @throw std::transaction_error in case of PMDK transaction failure
+	 * @throw pmem::transaction_alloc_error when allocating new memory
+	 * failed.
+	 * @throw pmem::transaction_free_error when freeing old underlying array
+	 * failed.
+	 * @throw rethrows constructor exception.
 	 */
 	concurrent_hash_map &
 	operator=(std::initializer_list<value_type> il)
@@ -2283,13 +2119,16 @@ public:
 	 * Useful to optimize performance before or after concurrent
 	 * operations.
 	 * Not thread safe.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	void rehash(size_type n = 0);
 
 	/**
 	 * Clear hash map content
-	 * @throws std::runtime_error in case of PMDK transaction failure
 	 * Not thread safe.
+	 *
+	 * @throws pmem::transaction_error in case of PMDK transaction failure
 	 */
 	void clear();
 
@@ -2308,6 +2147,8 @@ public:
 	/**
 	 * @returns an iterator to the beginning
 	 * Not thread safe.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	iterator
 	begin()
@@ -2351,7 +2192,7 @@ public:
 	size_type
 	size() const
 	{
-		return my_size.get_ro();
+		return this->my_size.get_ro();
 	}
 
 	/**
@@ -2360,7 +2201,7 @@ public:
 	bool
 	empty() const
 	{
-		return my_size.get_ro() == 0;
+		return this->my_size.get_ro() == 0;
 	}
 
 	/**
@@ -2392,14 +2233,16 @@ public:
 
 	/**
 	 * @return count of items (0 or 1)
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	size_type
 	count(const Key &key) const
 	{
-		return const_cast<concurrent_hash_map *>(this)
-			->lookup</*insert*/ false>(key, nullptr, nullptr,
-						   /*write=*/false,
-						   &do_not_allocate_node);
+		concurrent_hash_map_internal::check_outside_tx();
+
+		return const_cast<concurrent_hash_map *>(this)->internal_find(
+			key, nullptr, false);
 	}
 
 	/**
@@ -2410,33 +2253,38 @@ public:
 	 * this function without constructing an instance of Key
 	 *
 	 * @return count of items (0 or 1)
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	template <typename K,
 		  typename = typename std::enable_if<
-			  internal::has_transparent_key_equal<hasher>::value,
+			  concurrent_hash_map_internal::
+				  has_transparent_key_equal<hasher>::value,
 			  K>::type>
 	size_type
 	count(const K &key) const
 	{
-		return const_cast<concurrent_hash_map *>(this)
-			->lookup</*insert*/ false>(key, nullptr, nullptr,
-						   /*write=*/false,
-						   &do_not_allocate_node);
+		concurrent_hash_map_internal::check_outside_tx();
+
+		return const_cast<concurrent_hash_map *>(this)->internal_find(
+			key, nullptr, false);
 	}
 
 	/**
 	 * Find item and acquire a read lock on the item.
 	 * @return true if item is found, false otherwise.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	find(const_accessor &result, const Key &key) const
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return const_cast<concurrent_hash_map *>(this)
-			->lookup</*insert*/ false>(key, nullptr, &result,
-						   /*write=*/false,
-						   &do_not_allocate_node);
+		return const_cast<concurrent_hash_map *>(this)->internal_find(
+			key, &result, false);
 	}
 
 	/**
@@ -2449,34 +2297,39 @@ public:
 	 * this function without constructing an instance of Key
 	 *
 	 * @return true if item is found, false otherwise.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	template <typename K,
 		  typename = typename std::enable_if<
-			  internal::has_transparent_key_equal<hasher>::value,
+			  concurrent_hash_map_internal::
+				  has_transparent_key_equal<hasher>::value,
 			  K>::type>
 	bool
 	find(const_accessor &result, const K &key) const
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return const_cast<concurrent_hash_map *>(this)
-			->lookup</*insert*/ false>(key, nullptr, &result,
-						   /*write=*/false,
-						   &do_not_allocate_node);
+		return const_cast<concurrent_hash_map *>(this)->internal_find(
+			key, &result, false);
 	}
 
 	/**
 	 * Find item and acquire a write lock on the item.
 	 * @return true if item is found, false otherwise.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	find(accessor &result, const Key &key)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return lookup</*insert*/ false>(key, nullptr, &result,
-						/*write*/ true,
-						&do_not_allocate_node);
+		return internal_find(key, &result, true);
 	}
 
 	/**
@@ -2489,161 +2342,197 @@ public:
 	 * this function without constructing an instance of Key
 	 *
 	 * @return true if item is found, false otherwise.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	template <typename K,
 		  typename = typename std::enable_if<
-			  internal::has_transparent_key_equal<hasher>::value,
+			  concurrent_hash_map_internal::
+				  has_transparent_key_equal<hasher>::value,
 			  K>::type>
 	bool
 	find(accessor &result, const K &key)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return lookup</*insert*/ false>(key, nullptr, &result,
-						/*write*/ true,
-						&do_not_allocate_node);
+		return internal_find(key, &result, true);
 	}
 	/**
 	 * Insert item (if not already present) and
 	 * acquire a read lock on the item.
 	 * @return true if item is new.
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(const_accessor &result, const Key &key)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return lookup</*insert*/ true>(
-			key, &key, &result,
-			/*write=*/false, &allocate_node_default_construct);
+		return internal_insert(key, &result, false, key);
 	}
 
 	/**
 	 * Insert item (if not already present) and
 	 * acquire a write lock on the item.
 	 * @returns true if item is new.
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(accessor &result, const Key &key)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return lookup</*insert*/ true>(
-			key, &key, &result,
-			/*write=*/true, &allocate_node_default_construct);
+		return internal_insert(key, &result, true, key);
 	}
 
 	/**
 	 * Insert item by copying if there is no such key present already and
 	 * acquire a read lock on the item.
 	 * @return true if item is new.
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(const_accessor &result, const value_type &value)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return lookup</*insert*/ true>(value.first, &value, &result,
-					       /*write=*/false,
-					       &allocate_node_copy_construct);
+		return internal_insert(value.first, &result, false, value);
 	}
 
 	/**
 	 * Insert item by copying if there is no such key present already and
 	 * acquire a write lock on the item.
 	 * @return true if item is new.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(accessor &result, const value_type &value)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		result.release();
 
-		return lookup</*insert*/ true>(value.first, &value, &result,
-					       /*write=*/true,
-					       &allocate_node_copy_construct);
+		return internal_insert(value.first, &result, true, value);
 	}
 
 	/**
 	 * Insert item by copying if there is no such key present already
 	 * @return true if item is inserted.
+	 *
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(const value_type &value)
 	{
-		return lookup</*insert*/ true>(value.first, &value, nullptr,
-					       /*write=*/false,
-					       &allocate_node_copy_construct);
+		concurrent_hash_map_internal::check_outside_tx();
+
+		return internal_insert(value.first, nullptr, false, value);
 	}
 
 	/**
 	 * Insert item by copying if there is no such key present already and
 	 * acquire a read lock on the item.
 	 * @return true if item is new.
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(const_accessor &result, value_type &&value)
 	{
-		return generic_move_insert(result, std::move(value));
+		concurrent_hash_map_internal::check_outside_tx();
+
+		result.release();
+
+		return internal_insert(value.first, &result, false,
+				       std::move(value));
 	}
 
 	/**
 	 * Insert item by copying if there is no such key present already and
 	 * acquire a write lock on the item.
 	 * @return true if item is new.
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(accessor &result, value_type &&value)
 	{
-		return generic_move_insert(result, std::move(value));
+		concurrent_hash_map_internal::check_outside_tx();
+
+		result.release();
+
+		return internal_insert(value.first, &result, true,
+				       std::move(value));
 	}
 
 	/**
 	 * Insert item by copying if there is no such key present already
 	 * @return true if item is inserted.
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	insert(value_type &&value)
 	{
-		return generic_move_insert(accessor_not_used(),
-					   std::move(value));
+		concurrent_hash_map_internal::check_outside_tx();
+
+		return internal_insert(value.first, nullptr, false,
+				       std::move(value));
 	}
 
 	/**
 	 * Insert range [first, last)
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	template <typename I>
 	void
 	insert(I first, I last)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		for (; first != last; ++first)
 			insert(*first);
 	}
 
 	/**
 	 * Insert initializer list
-	 * @throw std::bad_alloc on allocation failure.
+	 * @throw pmem::transaction_alloc_error on allocation failure.
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	void
 	insert(std::initializer_list<value_type> il)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		insert(il.begin(), il.end());
 	}
 
 	/**
 	 * Remove element with corresponding key
+	 *
 	 * @return true if element was deleted by this call
-	 * @throws std::runtime_error in case of PMDK unable to free the memory
+	 * @throws pmem::transaction_free_error in case of PMDK unable to free
+	 * the memory
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	bool
 	erase(const Key &key)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		return internal_erase(key);
 	}
 
@@ -2657,79 +2546,69 @@ public:
 	 * this function without constructing an instance of Key
 	 *
 	 * @return true if element was deleted by this call
-	 * @throws std::runtime_error in case of PMDK unable to free the memory
+	 * @throws pmem::transaction_free_error in case of PMDK unable to free
+	 * the memory
+	 * @throw pmem::transaction_scope_error if called inside transaction
 	 */
 	template <typename K,
 		  typename = typename std::enable_if<
-			  internal::has_transparent_key_equal<hasher>::value,
+			  concurrent_hash_map_internal::
+				  has_transparent_key_equal<hasher>::value,
 			  K>::type>
 	bool
 	erase(const K &key)
 	{
+		concurrent_hash_map_internal::check_outside_tx();
+
 		return internal_erase(key);
 	}
 
 protected:
-	/**
-	 * Insert or find item and optionally acquire a lock on the item.
+	/*
+	 * Try to acquire the mutex for read or write.
+	 *
+	 * If acquiring succeeds returns true, otherwise retries for few times.
+	 * If acquiring fails after all attempts returns false.
 	 */
-	template <bool OpInsert, typename K>
-	bool lookup(const K &key, const void *param, const_accessor *result,
-		    bool write,
-		    void (*allocate_node)(pool_base &, persistent_ptr<node> &,
-					  const void *,
-					  const node_base_ptr_t &));
+	bool try_acquire_item(const_accessor *result, node_mutex_t &mutex,
+			      bool write);
+
+	template <typename K>
+	bool internal_find(const K &key, const_accessor *result, bool write);
+
+	template <typename K, typename... Args>
+	bool internal_insert(const K &key, const_accessor *result, bool write,
+			     Args &&... args);
+
+	/* Obtain pointer to node and lock bucket */
+	template <bool Bucket_rw_lock, typename K>
+	persistent_node_ptr_t
+	get_node(const K &key, bucket_accessor &b)
+	{
+		/* find a node */
+		auto n = search_bucket(key, b.get());
+
+		if (!n) {
+			if (Bucket_rw_lock && !b.is_writer() &&
+			    !scoped_lock_traits_type::upgrade_to_writer(b)) {
+				/* Rerun search_list, in case another
+				 * thread inserted the item during the
+				 * upgrade. */
+				n = search_bucket(key, b.get());
+				if (n) {
+					/* unfortunately, it did */
+					scoped_lock_traits_type::
+						downgrade_to_reader(b);
+					return n;
+				}
+			}
+		}
+
+		return n;
+	}
 
 	template <typename K>
 	bool internal_erase(const K &key);
-
-	struct accessor_not_used {
-		void
-		release()
-		{
-		}
-	};
-
-	friend const_accessor *
-	accessor_location(accessor_not_used const &)
-	{
-		return nullptr;
-	}
-
-	friend const_accessor *
-	accessor_location(const_accessor &a)
-	{
-		return &a;
-	}
-
-	friend bool
-	is_write_access_needed(accessor const &)
-	{
-		return true;
-	}
-
-	friend bool
-	is_write_access_needed(const_accessor const &)
-	{
-		return false;
-	}
-
-	friend bool
-	is_write_access_needed(accessor_not_used const &)
-	{
-		return false;
-	}
-
-	template <typename Accessor>
-	bool
-	generic_move_insert(Accessor &&result, value_type &&value)
-	{
-		result.release();
-		return lookup</*insert*/ true>(value.first, &value,
-					       accessor_location(result),
-					       is_write_access_needed(result),
-					       &allocate_node_move_construct);
-	}
 
 	void clear_segment(segment_index_t s);
 
@@ -2743,138 +2622,188 @@ protected:
 
 }; // class concurrent_hash_map
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
-template <bool OpInsert, typename K>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 bool
-concurrent_hash_map<Key, T, Hash, KeyEqual>::lookup(
-	const K &key, const void *param, const_accessor *result, bool write,
-	void (*allocate_node)(pool_base &, persistent_ptr<node> &, const void *,
-			      const node_base_ptr_t &))
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+		    ScopedLockType>::try_acquire_item(const_accessor *result,
+						      node_mutex_t &mutex,
+						      bool write)
+{
+	/* acquire the item */
+	if (!result->try_acquire(mutex, write)) {
+		for (detail::atomic_backoff backoff(true);;) {
+			if (result->try_acquire(mutex, write))
+				break;
+
+			if (!backoff.bounded_pause())
+				return false;
+		}
+	}
+
+	return true;
+}
+
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
+template <typename K>
+bool
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+		    ScopedLockType>::internal_find(const K &key,
+						   const_accessor *result,
+						   bool write)
 {
 	assert(!result || !result->my_node);
 
-	bool return_value = false;
-	hashcode_t const h = hasher{}(key);
-	hashcode_t m = mask().load(std::memory_order_acquire);
+	hashcode_type m = mask().load(std::memory_order_acquire);
 #if LIBPMEMOBJ_CPP_VG_HELGRIND_ENABLED
-	ANNOTATE_HAPPENS_AFTER(&my_mask);
+	ANNOTATE_HAPPENS_AFTER(&(this->my_mask));
 #endif
-	persistent_node_ptr_t n;
-	size_type sz = 0;
 
-restart : { /* lock scope */
 	assert((m & (m + 1)) == 0);
 
-	return_value = false;
+	hashcode_type const h = hasher{}(key);
 
-	/* get bucket */
-	bucket_accessor b(this, h & m);
+	persistent_node_ptr_t node;
 
-	/* find a node */
-	n = search_bucket(key, b.get());
+	while (true) {
+		/* get bucket and acquire the lock */
+		bucket_accessor b(
+			this, h & m,
+			scoped_lock_traits_type::initial_rw_state(false));
+		node = get_node<false>(key, b);
 
-	if (OpInsert) {
-		/* [opt] insert a key */
-		if (!n) {
-			if (!b.is_writer() && !b.upgrade_to_writer()) {
-				/* Rerun search_list, in case another thread
-				 * inserted the item during the upgrade. */
-				n = search_bucket(key, b.get());
-				if (is_valid(n)) {
-					/* unfortunately, it did */
-					b.downgrade_to_reader();
-					goto exists;
-				}
-			}
-
-			if (check_mask_race(h, m))
-				goto restart; /* b.release() is done in ~b(). */
-
-			assert(!is_valid(b->tmp_node));
-
-			/* insert and set flag to grow the container */
-			pool_base pop = get_pool_base();
-
-			allocate_node(pop,
-				      reinterpret_cast<persistent_ptr<node> &>(
-					      b->tmp_node),
-				      param, b->node_list);
-
-			n = b->tmp_node;
-			sz = insert_new_node(pop, b.get());
-			return_value = true;
-		}
-	} else { /* find or count */
-		if (!n) {
-			if (check_mask_race(h, m))
-				goto restart; /* b.release() is done in ~b(). */
-			return false;
-		}
-
-		return_value = true;
-	}
-exists:
-	if (!result)
-		goto check_growth;
-
-	/* acquire the item */
-	if (!result->try_acquire(n.get(my_pool_uuid)->mutex, write)) {
-		for (internal::atomic_backoff backoff(true);;) {
-			if (result->try_acquire(n.get(my_pool_uuid)->mutex,
-						write))
-				break;
-
-			if (!backoff.bounded_pause()) {
-				/* the wait takes really long, restart the
-				 * operation */
+		if (!node) {
+			/* Element was possibly relocated, try again */
+			if (check_mask_race(h, m)) {
 				b.release();
-
-				assert(!OpInsert || !return_value);
-
-				std::this_thread::yield();
-
-				m = mask().load(std::memory_order_acquire);
-
-				goto restart;
+				continue;
+			} else {
+				return false;
 			}
 		}
+
+		/* No need to acquire the item or item acquired */
+		if (!result ||
+		    try_acquire_item(
+			    result, node.get(this->my_pool_uuid)->mutex, write))
+			break;
+
+		/* the wait takes really long, restart the
+		 * operation */
+		b.release();
+
+		std::this_thread::yield();
+
+		m = mask().load(std::memory_order_acquire);
 	}
-} /* lock scope */
 
-	result->my_node = n.get_persistent_ptr(my_pool_uuid);
-	result->my_hash = h;
-check_growth:
-	/* [opt] grow the container */
-	check_growth(m, sz);
+	if (result) {
+		result->my_node = node.get_persistent_ptr(this->my_pool_uuid);
+		result->my_hash = h;
+	}
 
-	return return_value;
+	return true;
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
+template <typename K, typename... Args>
+bool
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+		    ScopedLockType>::internal_insert(const K &key,
+						     const_accessor *result,
+						     bool write,
+						     Args &&... args)
+{
+	assert(!result || !result->my_node);
+
+	hashcode_type m = mask().load(std::memory_order_acquire);
+#if LIBPMEMOBJ_CPP_VG_HELGRIND_ENABLED
+	ANNOTATE_HAPPENS_AFTER(&(this->my_mask));
+#endif
+
+	assert((m & (m + 1)) == 0);
+
+	hashcode_type const h = hasher{}(key);
+
+	persistent_node_ptr_t node;
+	size_t new_size = 0;
+	bool inserted = false;
+
+	while (true) {
+		/* get bucket and acquire the lock */
+		bucket_accessor b(
+			this, h & m,
+			scoped_lock_traits_type::initial_rw_state(true));
+		node = get_node<true>(key, b);
+
+		if (!node) {
+			/* Element was possibly relocated, try again */
+			if (check_mask_race(h, m)) {
+				b.release();
+				continue;
+			}
+
+			/* insert and set flag to grow the container */
+			new_size = insert_new_node(b.get(), node,
+						   std::forward<Args>(args)...);
+			inserted = true;
+		}
+
+		/* No need to acquire the item or item acquired */
+		if (!result ||
+		    try_acquire_item(
+			    result, node.get(this->my_pool_uuid)->mutex, write))
+			break;
+
+		/* the wait takes really long, restart the
+		 * operation */
+		b.release();
+
+		std::this_thread::yield();
+
+		m = mask().load(std::memory_order_acquire);
+	}
+
+	if (result) {
+		result->my_node = node.get_persistent_ptr(this->my_pool_uuid);
+		result->my_hash = h;
+	}
+
+	check_growth(m, new_size);
+
+	return inserted;
+}
+
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 template <typename K>
 bool
-concurrent_hash_map<Key, T, Hash, KeyEqual>::internal_erase(const K &key)
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+		    ScopedLockType>::internal_erase(const K &key)
 {
-	node_base_ptr_t n;
-	hashcode_t const h = hasher{}(key);
-	hashcode_t m = mask().load(std::memory_order_acquire);
+	node_ptr_t n;
+	hashcode_type const h = hasher{}(key);
+	hashcode_type m = mask().load(std::memory_order_acquire);
 	pool_base pop = get_pool_base();
 
 restart : {
 	/* lock scope */
 	/* get bucket */
-	bucket_accessor b(this, h & m);
+	bucket_accessor b(this, h & m,
+			  scoped_lock_traits_type::initial_rw_state(true));
 
 search:
-	node_base_ptr_t *p = &b->node_list;
+	node_ptr_t *p = &b->node_list;
 	n = *p;
 
-	while (is_valid(n) &&
+	while (n &&
 	       !key_equal{}(key,
 			    detail::static_persistent_pool_pointer_cast<node>(
-				    n)(my_pool_uuid)
+				    n)(this->my_pool_uuid)
 				    ->item.first)) {
-		p = &n(my_pool_uuid)->next;
+		p = &n(this->my_pool_uuid)->next;
 		n = *p;
 	}
 
@@ -2884,7 +2813,8 @@ search:
 			goto restart;
 
 		return false;
-	} else if (!b.is_writer() && !b.upgrade_to_writer()) {
+	} else if (!b.is_writer() &&
+		   !scoped_lock_traits_type::upgrade_to_writer(b)) {
 		if (check_mask_race(h, m)) /* contended upgrade, check mask */
 			goto restart;
 
@@ -2894,7 +2824,7 @@ search:
 	{
 		transaction::manual tx(pop);
 
-		tmp_node_ptr_t del = n(my_pool_uuid);
+		persistent_ptr<node> del = n(this->my_pool_uuid);
 
 		*p = del->next;
 
@@ -2914,54 +2844,58 @@ search:
 		transaction::commit();
 	}
 
-	--(my_size.get_rw());
-	pop.persist(my_size);
+	--(this->my_size.get_rw());
+	pop.persist(this->my_size);
 }
 
 	return true;
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 void
-concurrent_hash_map<Key, T, Hash, KeyEqual>::swap(
-	concurrent_hash_map<Key, T, Hash, KeyEqual> &table)
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType, ScopedLockType>::swap(
+	concurrent_hash_map<Key, T, Hash, KeyEqual, mutex_t, scoped_t> &table)
 {
 	internal_swap(table);
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 void
-concurrent_hash_map<Key, T, Hash, KeyEqual>::rehash(size_type sz)
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType, ScopedLockType>::rehash(
+	size_type sz)
 {
+	concurrent_hash_map_internal::check_outside_tx();
+
 	reserve(sz);
-	hashcode_t m = mask();
+	hashcode_type m = mask();
 
 	/* only the last segment should be scanned for rehashing size or first
 	 * index of the last segment */
-	hashcode_t b = (m + 1) >> 1;
+	hashcode_type b = (m + 1) >> 1;
 
 	/* zero or power of 2 */
 	assert((b & (b - 1)) == 0);
 
 	for (; b <= m; ++b) {
 		bucket *bp = get_bucket(b);
-		node_base_ptr_t n = bp->node_list;
 
-		assert(is_valid(n) || n == internal::empty_bucket ||
-		       bp->is_rehashed(std::memory_order_relaxed) == false);
-
-		internal::assert_not_locked(bp->mutex);
-
+		concurrent_hash_map_internal::assert_not_locked<mutex_t,
+								scoped_t>(
+			bp->mutex);
+		/* XXX Need to investigate if this statement is needed */
 		if (bp->is_rehashed(std::memory_order_relaxed) == false)
 			rehash_bucket<true>(bp, b);
 	}
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 void
-concurrent_hash_map<Key, T, Hash, KeyEqual>::clear()
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType, ScopedLockType>::clear()
 {
-	hashcode_t m = mask();
+	hashcode_type m = mask();
 
 	assert((m & (m + 1)) == 0);
 
@@ -2969,12 +2903,9 @@ concurrent_hash_map<Key, T, Hash, KeyEqual>::clear()
 	/* check consistency */
 	for (segment_index_t b = 0; b <= m; ++b) {
 		bucket *bp = get_bucket(b);
-		node_base_ptr_t n = bp->node_list;
-
-		assert(is_valid(n) || n == internal::empty_bucket ||
-		       bp->is_rehashed(std::memory_order_relaxed) == false);
-
-		internal::assert_not_locked(bp->mutex);
+		concurrent_hash_map_internal::assert_not_locked<mutex_t,
+								scoped_t>(
+			bp->mutex);
 	}
 #endif
 
@@ -2983,35 +2914,37 @@ concurrent_hash_map<Key, T, Hash, KeyEqual>::clear()
 
 		transaction::manual tx(pop);
 
-		my_size.get_rw() = 0;
+		this->my_size.get_rw() = 0;
 		segment_index_t s = segment_traits_t::segment_index_of(m);
 
-		assert(s + 1 == block_table_size ||
-		       !segment_facade_t(my_table, s + 1).is_valid());
+		assert(s + 1 == this->block_table_size ||
+		       !segment_facade_t(this->my_table, s + 1).is_valid());
 
 		do {
 			clear_segment(s);
 		} while (s-- > 0);
 
+		mask().store(embedded_buckets - 1, std::memory_order_relaxed);
+
 		transaction::commit();
 	}
-
-	mask().store(embedded_buckets - 1, std::memory_order_relaxed);
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 void
-concurrent_hash_map<Key, T, Hash, KeyEqual>::clear_segment(segment_index_t s)
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+		    ScopedLockType>::clear_segment(segment_index_t s)
 {
-	segment_facade_t segment(my_table, s);
+	segment_facade_t segment(this->my_table, s);
 
 	assert(segment.is_valid());
 
 	size_type sz = segment.size();
 	for (segment_index_t i = 0; i < sz; ++i) {
-		for (node_base_ptr_t n = segment[i].node_list; is_valid(n);
+		for (node_ptr_t n = segment[i].node_list; n;
 		     n = segment[i].node_list) {
-			segment[i].node_list = n(my_pool_uuid)->next;
+			segment[i].node_list = n(this->my_pool_uuid)->next;
 			delete_node(n);
 		}
 	}
@@ -3020,51 +2953,54 @@ concurrent_hash_map<Key, T, Hash, KeyEqual>::clear_segment(segment_index_t s)
 		segment.disable();
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 void
-concurrent_hash_map<Key, T, Hash, KeyEqual>::internal_copy(
-	const concurrent_hash_map &source)
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType, ScopedLockType>::
+	internal_copy(const concurrent_hash_map &source)
 {
 	reserve(source.my_size.get_ro());
 	internal_copy(source.begin(), source.end());
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 template <typename I>
 void
-concurrent_hash_map<Key, T, Hash, KeyEqual>::internal_copy(I first, I last)
+concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+		    ScopedLockType>::internal_copy(I first, I last)
 {
-	hashcode_t m = mask();
-	pool_base pop = get_pool_base();
+	hashcode_type m = mask();
 
 	for (; first != last; ++first) {
-		hashcode_t h = hasher{}(first->first);
+		hashcode_type h = hasher{}(first->first);
 		bucket *b = get_bucket(h & m);
 
 		assert(b->is_rehashed(std::memory_order_relaxed));
 
-		allocate_node_copy_construct(
-			pop,
-			reinterpret_cast<persistent_ptr<node> &>(b->tmp_node),
-			&(*first), b->node_list);
-
-		insert_new_node(pop, b);
+		detail::persistent_pool_ptr<node> p;
+		insert_new_node(b, p, *first);
 	}
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 inline bool
-operator==(const concurrent_hash_map<Key, T, Hash, KeyEqual> &a,
-	   const concurrent_hash_map<Key, T, Hash, KeyEqual> &b)
+operator==(const concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+				     ScopedLockType> &a,
+	   const concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+				     ScopedLockType> &b)
 {
 	if (a.size() != b.size())
 		return false;
 
-	typename concurrent_hash_map<Key, T, Hash, KeyEqual>::const_iterator i(
-		a.begin()),
+	typename concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+				     ScopedLockType>::const_iterator
+		i(a.begin()),
 		i_end(a.end());
 
-	typename concurrent_hash_map<Key, T, Hash, KeyEqual>::const_iterator j,
+	typename concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+				     ScopedLockType>::const_iterator j,
 		j_end(b.end());
 
 	for (; i != i_end; ++i) {
@@ -3077,23 +3013,26 @@ operator==(const concurrent_hash_map<Key, T, Hash, KeyEqual> &a,
 	return true;
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 inline bool
-operator!=(const concurrent_hash_map<Key, T, Hash, KeyEqual> &a,
-	   const concurrent_hash_map<Key, T, Hash, KeyEqual> &b)
+operator!=(const concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+				     ScopedLockType> &a,
+	   const concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType,
+				     ScopedLockType> &b)
 {
 	return !(a == b);
 }
 
-template <typename Key, typename T, typename Hash, typename KeyEqual>
+template <typename Key, typename T, typename Hash, typename KeyEqual,
+	  typename MutexType, typename ScopedLockType>
 inline void
-swap(concurrent_hash_map<Key, T, Hash, KeyEqual> &a,
-     concurrent_hash_map<Key, T, Hash, KeyEqual> &b)
+swap(concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType, ScopedLockType> &a,
+     concurrent_hash_map<Key, T, Hash, KeyEqual, MutexType, ScopedLockType> &b)
 {
 	a.swap(b);
 }
 
-} /* namespace experimental */
 } /* namespace obj */
 } /* namespace pmem */
 
